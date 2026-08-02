@@ -1,13 +1,11 @@
 import { WebSocketServer } from 'ws';
 import http from 'http';
 
-// ── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-const STALE_MS = 3 * 60 * 1000;      // drop presence after 3 min silence
-const PURGE_INTERVAL = 60 * 1000;    // clean stale entries every 60s
+const STALE_MS = 3 * 60 * 1000;
+const PURGE_INTERVAL = 60 * 1000;
 
-// ── Presence store ─────────────────────────────────────────────────────────
-// { email -> { lat, lng, ts, contacts: [email], ws } }
+// { email -> { lat, lng, ts, contacts, name, phone, homeLat, homeLng, ws } }
 const presence = new Map();
 
 function haversine(lat1, lng1, lat2, lng2) {
@@ -22,27 +20,55 @@ function haversine(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Is this user currently at their home location (within 20km)?
+function isAtHome(user) {
+  if (user.homeLat == null || user.homeLng == null) return false;
+  return haversine(user.lat, user.lng, user.homeLat, user.homeLng) < 20000;
+}
+
 function findNearby(email, radiusM) {
   const me = presence.get(email);
   if (!me) return [];
-
   const nearby = [];
+
   for (const [otherEmail, other] of presence) {
     if (otherEmail === email) continue;
     if (Date.now() - other.ts > STALE_MS) continue;
 
-    // Mutual consent: each must have the other in their contact list
-    const iMutual =
+    // Mutual contact check
+    const mutual =
       me.contacts.includes(otherEmail) &&
       other.contacts.includes(email);
-    if (!iMutual) continue;
+    if (!mutual) continue;
 
+    // Distance check — are they in the same city or airport?
     const dist = haversine(me.lat, me.lng, other.lat, other.lng);
-    if (dist <= radiusM) {
-      nearby.push({ email: otherEmail, distM: Math.round(dist) });
-    }
+    if (dist > radiusM) continue;
+
+    // Production rule: notify only when both people are in the same city
+    // AND at least one of them is away from home.
+    //
+    // Case matrix:
+    // - Both at home in same city        → suppressed (everyday situation)
+    // - One away, one at home, same city → notify ✓
+    // - Both away, same city             → notify ✓
+    // - Different cities (any combo)     → already filtered by distance check above
+    //
+    // The distance check above handles the "different cities" case entirely.
+    // This single line handles the only remaining suppression case.
+    if (isAtHome(me) && isAtHome(other)) continue;
+
+    nearby.push({
+      email: otherEmail,
+      name: other.name || otherEmail,
+      distM: Math.round(dist),
+    });
   }
   return nearby;
+}
+
+function send(ws, obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
 function purgeStale() {
@@ -55,7 +81,6 @@ function purgeStale() {
   }
 }
 
-// ── HTTP server (health check for Render/Railway) ──────────────────────────
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -66,7 +91,6 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// ── WebSocket server ───────────────────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
@@ -76,27 +100,60 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // ── ping: update position ────────────────────────────────────────────
+    // ── ping ───────────────────────────────────────────────────────────────
     if (msg.type === 'ping') {
-      const { email, lat, lng, contacts, radiusM } = msg;
-      if (!email || lat == null || lng == null) return;
-
+      const { email: rawEmail, name, phone, lat, lng, contacts, radiusM, homeLat, homeLng } = msg;
+      if (!rawEmail || lat == null || lng == null) return;
+      const email = rawEmail.toLowerCase().trim();
       clientEmail = email;
       presence.set(email, {
         lat, lng,
+        name: name || email,
+        phone: phone || null,
+        homeLat: homeLat ?? null,
+        homeLng: homeLng ?? null,
         ts: Date.now(),
-        contacts: Array.isArray(contacts) ? contacts : [],
+        contacts: Array.isArray(contacts) ? contacts.map(e => e.toLowerCase().trim()) : [],
         ws,
       });
-
-      const nearby = findNearby(email, radiusM || 300);
+      const nearby = findNearby(email, radiusM || 20000);
       send(ws, { type: 'nearby', nearby });
       console.log(`[ping] ${email} → ${nearby.length} nearby`);
     }
 
-    // ── bye: explicit disconnect ─────────────────────────────────────────
+    // ── message ────────────────────────────────────────────────────────────
+    if (msg.type === 'nudge') {
+      const { from: rawFrom, fromName, to: rawTo, message } = msg;
+      if (!rawFrom || !rawTo) return;
+      const from = rawFrom.toLowerCase().trim();
+      const to   = rawTo.toLowerCase().trim();
+      const sender   = presence.get(from);
+      const receiver = presence.get(to);
+      if (!sender || !receiver) {
+        send(ws, { type: 'nudge_result', success: false, reason: 'Contact is not currently online' });
+        return;
+      }
+      const mutual =
+        sender.contacts.includes(to) &&
+        receiver.contacts.includes(from);
+      if (!mutual) {
+        send(ws, { type: 'nudge_result', success: false, reason: 'Not a mutual contact' });
+        return;
+      }
+      send(receiver.ws, {
+        type: 'incoming_nudge',
+        from,
+        fromName: fromName || sender.name || from,
+        message: message || '👋',
+        ts: Date.now(),
+      });
+      send(ws, { type: 'nudge_result', success: true, to, toName: receiver.name || to, msgId: msg.msgId || null });
+      console.log(`[message] ${from} → ${to}`);
+    }
+
+    // ── bye ────────────────────────────────────────────────────────────────
     if (msg.type === 'bye') {
-      if (clientEmail) presence.delete(clientEmail);
+      if (clientEmail) presence.delete(clientEmail.toLowerCase().trim());
     }
   });
 
@@ -112,12 +169,8 @@ wss.on('connection', (ws) => {
   });
 });
 
-function send(ws, obj) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
-}
-
 setInterval(purgeStale, PURGE_INTERVAL);
 
 server.listen(PORT, () => {
-  console.log(`Nearish relay running on port ${PORT}`);
+  console.log(`Orbyt relay running on port ${PORT}`);
 });
