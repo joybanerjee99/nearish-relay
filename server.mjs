@@ -81,10 +81,40 @@ function purgeStale() {
   }
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  // CORS headers — allow requests from GitHub Pages
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', users: presence.size }));
+
+  } else if (req.url.startsWith('/geocode?')) {
+    // Server-side geocode — avoids iOS PWA fetch restrictions on client
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const city = params.get('city');
+    if (!city) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'city param required' }));
+      return;
+    }
+    try {
+      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`;
+      const r = await fetch(url, { headers: { 'Accept-Language': 'en', 'User-Agent': 'Orbyt/1.0' } });
+      const data = await r.json();
+      if (data && data[0]) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), name: data[0].display_name }));
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+      }
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+
   } else {
     res.writeHead(404);
     res.end();
@@ -102,20 +132,32 @@ wss.on('connection', (ws) => {
 
     // ── ping ───────────────────────────────────────────────────────────────
     if (msg.type === 'ping') {
-      const { email: rawEmail, name, phone, lat, lng, contacts, radiusM, homeLat, homeLng } = msg;
+      const { email: rawEmail, name, phone, lat, lng, contacts, radiusM, homeLat, homeLng, homeCity } = msg;
       if (!rawEmail || lat == null || lng == null) return;
       const email = rawEmail.toLowerCase().trim();
       clientEmail = email;
+
+      // Use provided home coords, or keep existing ones if already stored
+      const existing = presence.get(email);
+      const resolvedHomeLat = homeLat ?? existing?.homeLat ?? null;
+      const resolvedHomeLng = homeLng ?? existing?.homeLng ?? null;
+
       presence.set(email, {
         lat, lng,
         name: name || email,
         phone: phone || null,
-        homeLat: homeLat ?? null,
-        homeLng: homeLng ?? null,
+        homeLat: resolvedHomeLat,
+        homeLng: resolvedHomeLng,
         ts: Date.now(),
         contacts: Array.isArray(contacts) ? contacts.map(e => e.toLowerCase().trim()) : [],
         ws,
       });
+
+      // If client sent a homeCity and we have no home coords yet, geocode it
+      if (homeCity && resolvedHomeLat == null) {
+        geocodeCityForUser(email, homeCity, ws);
+      }
+
       const nearby = findNearby(email, radiusM || 20000);
       send(ws, { type: 'nearby', nearby });
       console.log(`[ping] ${email} → ${nearby.length} nearby`);
@@ -151,6 +193,16 @@ wss.on('connection', (ws) => {
       console.log(`[message] ${from} → ${to}`);
     }
 
+    // ── geocode_request: explicit geocode before first ping ───────────────
+    if (msg.type === 'geocode_request') {
+      const { email: rawEmail, city } = msg;
+      if (city && rawEmail) {
+        const email = rawEmail.toLowerCase().trim();
+        console.log(`[geocode_request] ${email} → ${city}`);
+        geocodeCityForUser(email, city, ws);
+      }
+    }
+
     // ── bye ────────────────────────────────────────────────────────────────
     if (msg.type === 'bye') {
       if (clientEmail) presence.delete(clientEmail.toLowerCase().trim());
@@ -168,6 +220,29 @@ wss.on('connection', (ws) => {
     if (clientEmail) presence.delete(clientEmail);
   });
 });
+
+// Geocode a city name and send result back to the client
+async function geocodeCityForUser(email, city, ws) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`;
+    const r = await fetch(url, { headers: { 'Accept-Language': 'en', 'User-Agent': 'Orbyt/1.0' } });
+    const data = await r.json();
+    if (data && data[0]) {
+      const lat = parseFloat(data[0].lat);
+      const lng = parseFloat(data[0].lon);
+      // Update presence with home coords
+      const p = presence.get(email);
+      if (p) { p.homeLat = lat; p.homeLng = lng; }
+      // Send result back to client
+      send(ws, { type: 'geocode_result', lat, lng, city });
+      console.log(`[geocode] ${email} home: ${city} → ${lat}, ${lng}`);
+    } else {
+      console.warn(`[geocode] No results for: ${city}`);
+    }
+  } catch (e) {
+    console.warn(`[geocode] Failed for ${city}:`, e.message);
+  }
+}
 
 setInterval(purgeStale, PURGE_INTERVAL);
 
