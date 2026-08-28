@@ -1,16 +1,19 @@
 {
-  "name": "nearish-relay",
-  "version": "1.0.0",
+  "name": "orbyt-relay",
+  "version": "2.0.0",
   "type": "module",
+  "description": "Orbyt proximity relay server with persistent accounts",
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "build": "npm install"
   },
   "dependencies": {
-    "ws": "^8.17.0"
+    "ws": "^8.18.0",
+    "better-sqlite3": "^9.6.0",
+    "resend": "^3.5.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   }
 }
