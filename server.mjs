@@ -212,7 +212,7 @@ async function sendMagicLink(email) {
 
   if (resend) {
     try {
-      await resend.emails.send({
+      const { data, error } = await resend.emails.send({
         from: FROM_EMAIL,
         to: email,
         subject: 'Your Orbyt login link',
@@ -234,9 +234,16 @@ async function sendMagicLink(email) {
           </div>
         `,
       });
-      console.log(`[email] Magic link sent to ${email}`);
+      // The Resend SDK resolves even on API-level rejections (bad key, unverified
+      // domain, sandbox restrictions) — it does not throw for those. Both branches
+      // must be checked, or a rejected send silently logs as a success.
+      if (error) {
+        console.error(`[email] Resend rejected the send to ${email}:`, error.name, '-', error.message);
+      } else {
+        console.log(`[email] Magic link sent to ${email} (id: ${data?.id})`);
+      }
     } catch (e) {
-      console.error('[email] Send failed:', e.message);
+      console.error('[email] Send threw:', e.message);
     }
   }
   return token;
