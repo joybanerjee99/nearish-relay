@@ -3,7 +3,7 @@ import http from 'http';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { Resend } from 'resend';
-import { createPacito } from './pacito.mjs';
+import { createNeerly } from './neerly.mjs';
 
 const PORT = process.env.PORT || 3000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -78,8 +78,8 @@ console.log('[db] SQLite database ready');
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 if (!resend) console.warn('[email] RESEND_API_KEY not set — magic links will be logged only');
 
-// ── Pacito (/pacito/... routes, pacito_* tables) ──────────────────────────
-const pacito = createPacito({ db, resend, appUrl: APP_URL, fromEmail: 'Pacito <onboarding@resend.dev>' });
+// ── Neerly (/neerly/... routes, neerly_* tables) ──────────────────────────
+const neerly = createNeerly({ db, resend, appUrl: APP_URL, fromEmail: 'Neerly <onboarding@resend.dev>' });
 
 // ── Presence map (in-memory, session only) ────────────────────────────────
 // email -> { lat, lng, homeLat, homeLng, name, phone, ws, ts }
@@ -290,8 +290,8 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url, `http://localhost`);
 
-  // Pacito routes
-  if (await pacito.handle(req, res, url)) return;
+  // Neerly routes
+  if (await neerly.handle(req, res, url)) return;
 
   // Health check
   if (url.pathname === '/health') {
