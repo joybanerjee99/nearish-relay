@@ -19,20 +19,22 @@ const MAX_SHARE_MS      = 4 * 60 * 60 * 1000;        // free cap: 4h total incl.
 const MAX_RECIPIENTS    = 20;
 const REQUEST_COOLDOWN  = 10 * 60 * 1000;            // one "request an update" per person per share per 10 min
 const MAX_BODY          = 32 * 1024;
+const REQUEST_ANSWER_MS = 24 * 60 * 60 * 1000;       // a share within 24h of a request counts as answering it
+const WEEK_MS           = 7 * 24 * 60 * 60 * 1000;
+// Buddy avatars (the drawings live in neerly.html; the server only checks the id).
+const AVATARS = ['cat','pup','bunny','fox','bear','panda','owl','frog','dragon','unicorn','ghost','robot'];
+const RESERVED_USERNAMES = new Set(['neerly','admin','administrator','support','help','root','me','api','system','official','staff','team','moderator','null','undefined']);
+// Trail: skip fuzzy fixes and GPS jumps so the line and the mileage stay honest.
+const TRAIL_MAX_ACCURACY = 60;    // m — fixes fuzzier than this still move the dot, but don't draw trail or add distance
+const TRAIL_MIN_STEP     = 12;    // m — ignore jitter smaller than this (or the fix's accuracy, up to 40 m)
+const TRAIL_MAX_SPEED    = 90;    // m/s (~320 km/h) — anything faster is a GPS glitch
+const TRAIL_MAX_POINTS   = 3000;
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   const PAGE_URL = process.env.NEERLY_URL || `${appUrl.replace(/\/$/, '')}/neerly.html`;
   const FROM = process.env.NEERLY_FROM_EMAIL || fromEmail || 'Neerly <onboarding@resend.dev>';
   const PEPPER = process.env.PASSWORD_SALT || '';
   if (!PEPPER) console.warn('[neerly] PASSWORD_SALT not set — add it in Render before real users sign up');
-
-  // One-time: carry over test data from before the rename (old "pacito_" tables).
-  // Runs only if old tables exist; delete this block after the first deploy.
-  for (const t of ['users','sessions','reset_tokens','contacts','shares','share_recipients','update_requests']) {
-    const has = (n) => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(n);
-    if (has(`pacito_${t}`) && !has(`neerly_${t}`)) db.exec(`ALTER TABLE pacito_${t} RENAME TO neerly_${t}`);
-  }
-  for (const i of ['sessions_email','contacts_owner','shares_sender','recipients_share']) db.exec(`DROP INDEX IF EXISTS idx_pacito_${i}`);
 
   // ── Schema ────────────────────────────────────────────────────────────────
   db.exec(`
@@ -97,12 +99,44 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     CREATE INDEX IF NOT EXISTS idx_neerly_contacts_owner ON neerly_contacts(owner_email);
     CREATE INDEX IF NOT EXISTS idx_neerly_shares_sender ON neerly_shares(sender_email, ended_at);
     CREATE INDEX IF NOT EXISTS idx_neerly_recipients_share ON neerly_share_recipients(share_id);
+    -- v0.4: trail points exist only while a share is live (deleted when it ends)
+    CREATE TABLE IF NOT EXISTS neerly_share_points (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      share_id INTEGER NOT NULL,
+      lat REAL NOT NULL, lng REAL NOT NULL,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_points_share ON neerly_share_points(share_id, id);
+    -- v0.4: lifetime totals per user. Numbers only, never coordinates.
+    CREATE TABLE IF NOT EXISTS neerly_stats (
+      email TEXT PRIMARY KEY,
+      shares_sent INTEGER NOT NULL DEFAULT 0,
+      minutes_shared REAL NOT NULL DEFAULT 0,
+      distance_m REAL NOT NULL DEFAULT 0,
+      times_watched INTEGER NOT NULL DEFAULT 0,
+      requests_answered INTEGER NOT NULL DEFAULT 0,
+      streak_weeks INTEGER NOT NULL DEFAULT 0,
+      best_streak INTEGER NOT NULL DEFAULT 0,
+      last_week INTEGER
+    );
   `);
+  // v0.4 columns on existing tables (added in place; existing data is kept)
+  const addCol = (table, col, def) => {
+    if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  };
+  addCol('neerly_users', 'username', 'TEXT');
+  addCol('neerly_users', 'avatar', 'TEXT');
+  addCol('neerly_shares', 'distance_m', 'REAL NOT NULL DEFAULT 0');
+  addCol('neerly_shares', 'link_views', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_update_requests', 'answered_at', 'INTEGER');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
   // Anonymous viewers (opened the generic link from WhatsApp etc.). In-memory:
   // shareId -> Map(viewerId -> lastPingMs). Losing this on restart is harmless.
   const anonViewers = new Map();
+  // shareId -> Set(viewerId) of every link viewer seen during the share (for "times watched").
+  const anonSeen = new Map();
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const now = () => Date.now();
@@ -150,7 +184,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const q = {
     userByEmail:   db.prepare('SELECT * FROM neerly_users WHERE email = ?'),
-    insertUser:    db.prepare('INSERT INTO neerly_users (email, name, pw_hash, pw_salt, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertUser:    db.prepare('INSERT INTO neerly_users (email, name, pw_hash, pw_salt, created_at, last_seen, username, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+    userByUsername:db.prepare('SELECT email FROM neerly_users WHERE username = ?'),
+    usersNoUsername: db.prepare('SELECT email FROM neerly_users WHERE username IS NULL'),
+    setUsername:   db.prepare('UPDATE neerly_users SET username = ? WHERE email = ?'),
+    setProfile:    db.prepare('UPDATE neerly_users SET name = ?, username = ?, avatar = ? WHERE email = ?'),
+    delOtherSessions: db.prepare('DELETE FROM neerly_sessions WHERE email = ? AND token != ?'),
     setPassword:   db.prepare('UPDATE neerly_users SET pw_hash = ?, pw_salt = ? WHERE email = ?'),
     touchUser:     db.prepare('UPDATE neerly_users SET last_seen = ? WHERE email = ?'),
     insertSession: db.prepare('INSERT INTO neerly_sessions (token, email, expires_at) VALUES (?, ?, ?)'),
@@ -171,8 +210,28 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     shareByToken:  db.prepare('SELECT * FROM neerly_shares WHERE token = ?'),
     activeShareFor:db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL AND expires_at > ? ORDER BY started_at DESC LIMIT 1'),
     endShare:      db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL WHERE id = ? AND ended_at IS NULL'),
-    endOpenSharesFor: db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL WHERE sender_email = ? AND ended_at IS NULL'),
-    expireShares:  db.prepare('UPDATE neerly_shares SET ended_at = expires_at, lat = NULL, lng = NULL, accuracy = NULL WHERE ended_at IS NULL AND expires_at <= ?'),
+    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL WHERE id = ?'),
+    openSharesFor: db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL'),
+    expiredOpen:   db.prepare('SELECT * FROM neerly_shares WHERE ended_at IS NULL AND expires_at <= ?'),
+    shareById:     db.prepare('SELECT * FROM neerly_shares WHERE id = ?'),
+    addShareDist:  db.prepare('UPDATE neerly_shares SET distance_m = distance_m + ? WHERE id = ?'),
+    incLinkViews:  db.prepare('UPDATE neerly_shares SET link_views = link_views + 1 WHERE id = ?'),
+
+    insertPoint:   db.prepare('INSERT INTO neerly_share_points (share_id, lat, lng, at) VALUES (?, ?, ?, ?)'),
+    lastPoint:     db.prepare('SELECT lat, lng, at FROM neerly_share_points WHERE share_id = ? ORDER BY id DESC LIMIT 1'),
+    countPoints:   db.prepare('SELECT COUNT(*) n FROM neerly_share_points WHERE share_id = ?'),
+    pointsFrom:    db.prepare('SELECT lat, lng FROM neerly_share_points WHERE share_id = ? ORDER BY id LIMIT -1 OFFSET ?'),
+    delPoints:     db.prepare('DELETE FROM neerly_share_points WHERE share_id = ?'),
+
+    ensureStats:   db.prepare('INSERT OR IGNORE INTO neerly_stats (email) VALUES (?)'),
+    stats:         db.prepare('SELECT * FROM neerly_stats WHERE email = ?'),
+    statsEnd:      db.prepare('UPDATE neerly_stats SET minutes_shared = minutes_shared + ?, distance_m = distance_m + ? WHERE email = ?'),
+    statsShare:    db.prepare('UPDATE neerly_stats SET shares_sent = shares_sent + 1, streak_weeks = ?, best_streak = MAX(best_streak, ?), last_week = ? WHERE email = ?'),
+    statsWatched:  db.prepare('UPDATE neerly_stats SET times_watched = times_watched + 1 WHERE email = ?'),
+    statsAnswered: db.prepare('UPDATE neerly_stats SET requests_answered = requests_answered + ? WHERE email = ?'),
+    peopleCount:   db.prepare('SELECT COUNT(DISTINCT r.email) n FROM neerly_share_recipients r JOIN neerly_shares s ON s.id = r.share_id WHERE s.sender_email = ?'),
+    answerRequests:db.prepare(`UPDATE neerly_update_requests SET answered_at = ? WHERE answered_at IS NULL AND created_at > ?
+                               AND share_id IN (SELECT id FROM neerly_shares WHERE sender_email = ?)`),
     setLocation:   db.prepare('UPDATE neerly_shares SET lat = ?, lng = ?, accuracy = ?, loc_at = ? WHERE id = ?'),
     extendShare:   db.prepare('UPDATE neerly_shares SET expires_at = ? WHERE id = ?'),
 
@@ -189,13 +248,149 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     purgeResets:   db.prepare('DELETE FROM neerly_reset_tokens WHERE expires_at < ? OR used = 1'),
   };
 
+  // Account deletion: everything tied to the user goes.
+  const deleteAccount = db.transaction((email) => {
+    const ids = db.prepare('SELECT id FROM neerly_shares WHERE sender_email = ?').all(email).map(r => r.id);
+    for (const id of ids) {
+      db.prepare('DELETE FROM neerly_share_points WHERE share_id = ?').run(id);
+      db.prepare('DELETE FROM neerly_share_recipients WHERE share_id = ?').run(id);
+      db.prepare('DELETE FROM neerly_update_requests WHERE share_id = ?').run(id);
+      anonViewers.delete(id); anonSeen.delete(id);
+    }
+    db.prepare('DELETE FROM neerly_shares WHERE sender_email = ?').run(email);
+    db.prepare('DELETE FROM neerly_update_requests WHERE requester_email = ?').run(email);
+    db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ?').run(email);
+    db.prepare('DELETE FROM neerly_sessions WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_reset_tokens WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_stats WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_users WHERE email = ?').run(email);
+  });
+
+  // ── Usernames ───────────────────────────────────────────────────────────────
+  // 3–20 chars: a–z, 0–9, dot, underscore. Stored lowercase; unique regardless of case.
+  const normUsername = (u) => String(u ?? '').trim().replace(/^@/, '').toLowerCase();
+  function usernameProblem(u) {
+    if (!u) return 'Pick a username';
+    if (u.length < 3) return 'Usernames need at least 3 characters';
+    if (u.length > 20) return 'Usernames can be up to 20 characters';
+    if (!/^[a-z0-9._]+$/.test(u)) return 'Use letters, numbers, dots or underscores';
+    if (/^[._]|[._]$/.test(u)) return 'Can’t start or end with a dot or underscore';
+    if (/[._]{2}/.test(u)) return 'No two dots or underscores in a row';
+    if (RESERVED_USERNAMES.has(u)) return 'That one’s reserved';
+    return null;
+  }
+  function usernameTaken(u, exceptEmail) {
+    const row = q.userByUsername.get(u);
+    return !!row && row.email !== exceptEmail;
+  }
+  function usernameBase(s) {
+    let b = String(s || '').toLowerCase().replace(/\+.*$/, '').replace(/[^a-z0-9._]/g, '')
+      .replace(/[._]{2,}/g, '.').replace(/^[._]+|[._]+$/g, '').slice(0, 16).replace(/[._]+$/, '');
+    if (b.length < 3) b = (b + 'buddy').slice(0, 16);
+    if (RESERVED_USERNAMES.has(b)) b += '1';
+    return b;
+  }
+  // First free name built from `seed` (an email or a wanted username): joy → joy, joy2, joy3…
+  function suggestUsername(seed, exceptEmail) {
+    const base = usernameBase(String(seed).includes('@') ? String(seed).split('@')[0] : seed);
+    for (let i = 1; i < 60; i++) {
+      const cand = i === 1 ? base : i < 20 ? `${base}${i}` : `${base.slice(0, 14)}${crypto.randomInt(100, 1000)}`;
+      if (!usernameProblem(cand) && !usernameTaken(cand, exceptEmail)) return cand;
+    }
+    return `buddy${crypto.randomInt(100000, 1000000)}`;
+  }
+  // Accounts from before v0.4 get a username from their email.
+  for (const { email } of q.usersNoUsername.all()) q.setUsername.run(suggestUsername(email, email), email);
+
+  // ── Stats ───────────────────────────────────────────────────────────────────
+  const weekIndex = (t) => Math.floor((t - 4 * 86400000) / WEEK_MS); // weeks start Monday 00:00 UTC
+  function statsFor(email) {
+    q.ensureStats.run(email);
+    const s = q.stats.get(email);
+    const w = weekIndex(now());
+    const alive = s.last_week != null && s.last_week >= w - 1; // streak survives until a full week is missed
+    return {
+      shares: s.shares_sent,
+      minutesShared: Math.round(s.minutes_shared),
+      distanceM: Math.round(s.distance_m),
+      people: q.peopleCount.get(email).n,
+      timesWatched: s.times_watched,
+      requestsAnswered: s.requests_answered,
+      streakWeeks: alive ? s.streak_weeks : 0,
+      bestStreak: s.best_streak,
+    };
+  }
+  function countShareStart(email, t) {
+    q.ensureStats.run(email);
+    const s = q.stats.get(email);
+    const w = weekIndex(t);
+    let streak = s.streak_weeks;
+    if (s.last_week === w) { /* already counted this week */ }
+    else if (s.last_week === w - 1) streak += 1;
+    else streak = 1;
+    q.statsShare.run(streak, streak, w, email);
+    const answered = q.answerRequests.run(t, t - REQUEST_ANSWER_MS, email).changes;
+    if (answered) q.statsAnswered.run(answered, email);
+  }
+
+  // Ends a share once: wipes its location and trail, adds its minutes and distance to the lifetime totals.
+  function finalizeShare(share, endedAt) {
+    db.transaction(() => {
+      const changed = q.endShare.run(endedAt, share.id).changes;
+      q.wipeShareLoc.run(share.id);
+      q.delPoints.run(share.id);
+      if (changed) {
+        const fresh = q.shareById.get(share.id);
+        q.ensureStats.run(fresh.sender_email);
+        q.statsEnd.run(Math.max(0, endedAt - fresh.started_at) / 60000, fresh.distance_m || 0, fresh.sender_email);
+      }
+    })();
+    anonViewers.delete(share.id);
+    anonSeen.delete(share.id);
+  }
+
+  // ── Trail ───────────────────────────────────────────────────────────────────
+  function meters(a, b) {
+    const R = 6371000, rad = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+  function addTrailPoint(shareId, lat, lng, accuracy, t) {
+    if (accuracy != null && accuracy > TRAIL_MAX_ACCURACY) return;
+    const last = q.lastPoint.get(shareId);
+    if (!last) { q.insertPoint.run(shareId, lat, lng, t); return; }
+    const d = meters(last, { lat, lng });
+    if (d < Math.max(TRAIL_MIN_STEP, Math.min(accuracy ?? 20, 40))) return;
+    const secs = (t - last.at) / 1000;
+    if (secs > 0 && d / secs > TRAIL_MAX_SPEED) return;
+    if (q.countPoints.get(shareId).n >= TRAIL_MAX_POINTS) return;
+    q.insertPoint.run(shareId, lat, lng, t);
+    q.addShareDist.run(d, shareId);
+  }
+  const r6 = (n) => Math.round(n * 1e6) / 1e6;
+  function trailSlice(shareId, from) {
+    const off = Math.max(0, Math.floor(Number(from) || 0));
+    const pts = q.pointsFrom.all(shareId, off).map(p => [r6(p.lat), r6(p.lng)]);
+    return { trail: pts, trailFrom: off, trailCount: off + pts.length };
+  }
+  function shareSummary(share) {
+    const rs = q.recipients.all(share.id);
+    return {
+      minutes: Math.max(0, Math.round(((share.ended_at || now()) - share.started_at) / 60000)),
+      distanceM: Math.round(share.distance_m || 0),
+      watchedBy: rs.filter(r => r.opened_at).map(r => r.nickname || r.email.split('@')[0]),
+      linkViewers: share.link_views || 0,
+    };
+  }
+
   function newSession(email) {
     const token = randToken(32);
     q.insertSession.run(token, email, now() + SESSION_MS);
     return token;
   }
 
-  function publicUser(u) { return { email: u.email, name: u.name }; }
+  function publicUser(u) { return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null }; }
 
   // Returns the signed-in user or null. Bearer token in Authorization header.
   function authUser(req) {
@@ -277,8 +472,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
   function endIfExpired(share) {
     if (!share.ended_at && share.expires_at <= now()) {
-      q.endShare.run(share.expires_at, share.id);
-      anonViewers.delete(share.id);
+      finalizeShare(share, share.expires_at);
       return q.shareByToken.get(share.token);
     }
     return share;
@@ -290,7 +484,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return 'sent';
   }
 
-  function senderView(share) {
+  function senderView(share, trailFrom = 0) {
     const t = now();
     const anon = anonViewers.get(share.id);
     let anonWatching = 0;
@@ -309,6 +503,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         openedAt: r.opened_at, lastPingAt: r.last_ping_at,
       })),
       linkViewersWatching: anonWatching,
+      distanceM: Math.round(share.distance_m || 0),
+      ...(isActive(share) ? trailSlice(share.id, trailFrom) : { trail: [], trailFrom: 0, trailCount: 0 }),
+      summary: isActive(share) ? null : shareSummary(share),
     };
   }
 
@@ -325,17 +522,26 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
     // ---- Auth ----
     if (p === '/neerly/auth/signup' && M === 'POST') {
-      const { name, email, password } = await readBody(req);
+      const { name, email, password, username, avatar } = await readBody(req);
       const e = norm(email), n = clean(name, 40);
       if (!n) throw new HttpError(400, 'Please add your name');
       if (!isEmail(e)) throw new HttpError(400, 'That email doesn’t look right');
       if (typeof password !== 'string' || password.length < 8) throw new HttpError(400, 'Password needs at least 8 characters');
       if (password.length > 200) throw new HttpError(400, 'Password is too long');
       if (q.userByEmail.get(e)) throw new HttpError(409, 'There’s already an account for that email — try signing in');
+      let un;
+      if (username != null && String(username).trim() !== '') {
+        un = normUsername(username);
+        const problem = usernameProblem(un);
+        if (problem) return json(res, 400, { error: problem, field: 'username' });
+        if (usernameTaken(un)) return json(res, 409, { error: `@${un} is taken — how about @${suggestUsername(un)}?`, field: 'username', suggestion: suggestUsername(un) });
+      } else un = suggestUsername(e); // recipient sign-up path has no username field
+      const av = AVATARS.includes(avatar) ? avatar : null;
       const salt = randToken(16);
-      q.insertUser.run(e, n, hashPassword(password, salt), salt, now(), now());
-      console.log(`[neerly:auth] signup ${e}`);
-      return json(res, 200, { token: newSession(e), user: { email: e, name: n } });
+      q.insertUser.run(e, n, hashPassword(password, salt), salt, now(), now(), un, av);
+      q.ensureStats.run(e);
+      console.log(`[neerly:auth] signup ${e} @${un}`);
+      return json(res, 200, { token: newSession(e), user: publicUser(q.userByEmail.get(e)) });
     }
 
     if (p === '/neerly/auth/signin' && M === 'POST') {
@@ -382,7 +588,69 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (p === '/neerly/me' && M === 'GET') {
       const u = requireUser(req);
       const active = q.activeShareFor.get(u.email, now());
-      return json(res, 200, { user: publicUser(u), activeShare: active ? senderView(active) : null });
+      return json(res, 200, { user: publicUser(u), stats: statsFor(u.email), activeShare: active ? senderView(active) : null });
+    }
+
+    // Username check / suggestion. ?u= checks a wanted name; ?email= suggests one from an email.
+    if (p === '/neerly/username' && M === 'GET') {
+      const me = authUser(req);
+      const except = me?.email;
+      const wanted = url.searchParams.get('u');
+      if (wanted != null && wanted !== '') {
+        const un = normUsername(wanted);
+        const problem = usernameProblem(un);
+        const taken = !problem && usernameTaken(un, except);
+        return json(res, 200, {
+          username: un, available: !problem && !taken,
+          problem: problem || (taken ? `@${un} is taken` : null),
+          suggestion: problem || taken ? suggestUsername(problem ? usernameBase(un) : un, except) : un,
+        });
+      }
+      const em = norm(url.searchParams.get('email'));
+      return json(res, 200, { suggestion: suggestUsername(em || 'buddy', except) });
+    }
+
+    if (p === '/neerly/me/profile' && M === 'POST') {
+      const u = requireUser(req);
+      const body = await readBody(req);
+      const n = body.name !== undefined ? clean(body.name, 40) : u.name;
+      if (!n) throw new HttpError(400, 'Please add your name');
+      let un = u.username;
+      if (body.username !== undefined) {
+        un = normUsername(body.username);
+        const problem = usernameProblem(un);
+        if (problem) return json(res, 400, { error: problem, field: 'username' });
+        if (usernameTaken(un, u.email)) return json(res, 409, { error: `@${un} is taken — how about @${suggestUsername(un, u.email)}?`, field: 'username', suggestion: suggestUsername(un, u.email) });
+      }
+      let av = u.avatar;
+      if (body.avatar !== undefined) {
+        if (!AVATARS.includes(body.avatar)) throw new HttpError(400, 'Pick one of the buddies');
+        av = body.avatar;
+      }
+      q.setProfile.run(n, un, av, u.email);
+      return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
+    }
+
+    if (p === '/neerly/me/password' && M === 'POST') {
+      const u = requireUser(req);
+      const { current, password } = await readBody(req);
+      if (typeof current !== 'string' || !checkPassword(current, u)) throw new HttpError(400, 'Your current password isn’t right');
+      if (typeof password !== 'string' || password.length < 8) throw new HttpError(400, 'New password needs at least 8 characters');
+      if (password.length > 200) throw new HttpError(400, 'Password is too long');
+      const salt = randToken(16);
+      q.setPassword.run(hashPassword(password, salt), salt, u.email);
+      const tok = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+      q.delOtherSessions.run(u.email, tok); // other devices sign out; this one stays in
+      return json(res, 200, { ok: true });
+    }
+
+    if (p === '/neerly/me/delete' && M === 'POST') {
+      const u = requireUser(req);
+      const { password } = await readBody(req);
+      if (typeof password !== 'string' || !checkPassword(password, u)) throw new HttpError(400, 'Password isn’t right');
+      deleteAccount(u.email);
+      console.log(`[neerly:auth] deleted account ${u.email}`);
+      return json(res, 200, { ok: true });
     }
 
     // ---- Contacts ----
@@ -428,10 +696,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
       const t = now();
       const token = randToken(18);
+      for (const old of q.openSharesFor.all(u.email)) finalizeShare(old, t); // one live share at a time
       const created = db.transaction(() => {
-        q.endOpenSharesFor.run(t, u.email); // one live share at a time
         const info = q.insertShare.run(token, u.email, u.name, t, t + Number(minutes) * 60000,
           Number(lat), Number(lng), numOrNull(accuracy), t);
+        addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
+        countShareStart(u.email, t);
         for (const r of rs) {
           q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12));
           q.upsertContact.run(u.email, r.email, r.nickname, t); // remember for next time
@@ -463,19 +733,34 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         let recipient = null;
         if (r) {
           recipient = q.recipientByView.get(share.id, r);
-          if (recipient && active) q.pingRecipient.run(now(), now(), recipient.id);
+          if (recipient && active) {
+            if (!recipient.opened_at) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); }
+            q.pingRecipient.run(now(), now(), recipient.id);
+          }
         } else if (viewer && active && /^[A-Za-z0-9_-]{6,40}$/.test(viewer)) {
           if (!anonViewers.has(share.id)) anonViewers.set(share.id, new Map());
           anonViewers.get(share.id).set(viewer, now());
+          if (!anonSeen.has(share.id)) anonSeen.set(share.id, new Set());
+          const seen = anonSeen.get(share.id);
+          if (!seen.has(viewer) && seen.size < 500) {
+            seen.add(viewer);
+            q.incLinkViews.run(share.id);
+            q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email);
+          }
         }
+        const sender = q.userByEmail.get(share.sender_email);
         return json(res, 200, {
           share: {
             senderName: share.sender_name,
+            senderAvatar: sender?.avatar || null,
             active,
             startedAt: share.started_at,
             expiresAt: share.expires_at,
             endedAt: share.ended_at,
             location: active && share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
+            distanceM: Math.round(share.distance_m || 0),
+            ...(active ? trailSlice(share.id, url.searchParams.get('t')) : { trail: [], trailFrom: 0, trailCount: 0 }),
+            summary: active ? null : { minutes: shareSummary(share).minutes, distanceM: Math.round(share.distance_m || 0) },
           },
           // Lets the expired screen pre-fill the email of a recipient we already know.
           recipient: recipient ? { email: recipient.email, nickname: recipient.nickname } : null,
@@ -484,17 +769,21 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
       if (action === 'status' && M === 'GET') {
         const u = requireUser(req);
-        return json(res, 200, { share: senderView(loadOwnedShare(token, u)) });
+        return json(res, 200, { share: senderView(loadOwnedShare(token, u), url.searchParams.get('t')) });
       }
 
       if (action === 'location' && M === 'POST') {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
         if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
-        const { lat, lng, accuracy } = await readBody(req);
+        const { lat, lng, accuracy, trailFrom } = await readBody(req);
         if (!validCoord(lat, lng)) throw new HttpError(400, 'Invalid location');
-        q.setLocation.run(Number(lat), Number(lng), numOrNull(accuracy), now(), share.id);
-        return json(res, 200, { share: senderView(q.shareByToken.get(token)) });
+        const t = now();
+        db.transaction(() => {
+          q.setLocation.run(Number(lat), Number(lng), numOrNull(accuracy), t, share.id);
+          addTrailPoint(share.id, Number(lat), Number(lng), numOrNull(accuracy), t);
+        })();
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), trailFrom) });
       }
 
       if (action === 'extend' && M === 'POST') {
@@ -507,14 +796,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const next = Math.min(share.expires_at + Number(minutes) * 60000, cap);
         if (next <= share.expires_at) throw new HttpError(400, 'Shares can run up to 4 hours in total');
         q.extendShare.run(next, share.id);
-        return json(res, 200, { share: senderView(q.shareByToken.get(token)), capped: next === cap });
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0), capped: next === cap });
       }
 
       if (action === 'stop' && M === 'POST') {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
-        q.endShare.run(now(), share.id);
-        anonViewers.delete(share.id);
+        finalizeShare(share, now());
         console.log(`[neerly:share] ${u.email} stopped ${token}`);
         return json(res, 200, { share: senderView(q.shareByToken.get(token)) });
       }
@@ -572,7 +860,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // ── Housekeeping: expire shares (and wipe their coordinates), purge tokens ──
   function sweep() {
     const t = now();
-    const n = q.expireShares.run(t).changes;
+    const expired = q.expiredOpen.all(t);
+    for (const sh of expired) finalizeShare(sh, sh.expires_at);
+    const n = expired.length;
     if (n) console.log(`[neerly:sweep] expired ${n} share(s), location wiped`);
     q.purgeSessions.run(t);
     q.purgeResets.run(t);
