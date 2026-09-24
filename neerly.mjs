@@ -29,6 +29,27 @@ const TRAIL_MAX_ACCURACY = 60;    // m — fixes fuzzier than this still move th
 const TRAIL_MIN_STEP     = 12;    // m — ignore jitter smaller than this (or the fix's accuracy, up to 40 m)
 const TRAIL_MAX_SPEED    = 90;    // m/s (~320 km/h) — anything faster is a GPS glitch
 const TRAIL_MAX_POINTS   = 3000;
+// v0.5 — badges and the rewards they unlock. Rewards only dress up your own buddy; they never change what's shared.
+// kind: 'head' | 'face' | 'neck' (buddy outfit slots), 'trail' (trail style), 'icon' (alternate app icon)
+const BADGES = [
+  { id: 'first_steps',    test: s => s.shares >= 1,              reward: { kind: 'trail', id: 'footprints' } },
+  { id: 'out_and_about',  test: s => s.shares >= 10,             reward: { kind: 'head',  id: 'beanie' } },
+  { id: 'trailblazer',    test: s => s.distanceM >= 10000,       reward: { kind: 'trail', id: 'paws' } },
+  { id: 'marathon',       test: s => s.distanceM >= 42195,       reward: { kind: 'face',  id: 'sunglasses' } },
+  { id: 'coast_to_coast', test: s => s.distanceM >= 4500000,     reward: { kind: 'head',  id: 'wizard' } },
+  { id: 'on_call',        test: s => s.requestsAnswered >= 5,    reward: { kind: 'neck',  id: 'bowtie' } },
+  { id: 'popular',        test: s => s.timesWatched >= 25,       reward: { kind: 'head',  id: 'crown' } },
+  { id: 'my_people',      test: s => s.people >= 5,              reward: { kind: 'neck',  id: 'scarf' } },
+  { id: 'regular',        test: s => s.bestStreak >= 4,          reward: { kind: 'trail', id: 'sparkles' } },
+  { id: 'night_owl',      test: s => s.nightShares >= 1,         reward: { kind: 'icon',  id: 'night' } },
+  { id: 'early_bird',     test: s => s.earlyShares >= 1,         reward: { kind: 'head',  id: 'flowers' } },
+  { id: 'mutual',         test: s => s.shareBacks >= 5,          reward: { kind: 'head',  id: 'partyhat' } },
+  { id: 'connector',      test: s => s.friendsJoined >= 3,       reward: { kind: 'trail', id: 'rainbow' } },
+];
+const OUTFIT_SLOTS = ['head', 'face', 'neck'];
+const DEFAULT_TRAIL = 'dots';
+const SHARE_BACK_WINDOW = 24 * 60 * 60 * 1000;   // you can share back up to a day after their share
+const SHARE_BACK_COOLDOWN = 10 * 60 * 1000;      // and not more than once per 10 minutes per share
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   const PAGE_URL = process.env.NEERLY_URL || `${appUrl.replace(/\/$/, '')}/neerly.html`;
@@ -119,6 +140,22 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       best_streak INTEGER NOT NULL DEFAULT 0,
       last_week INTEGER
     );
+    -- v0.5
+    CREATE TABLE IF NOT EXISTS neerly_badges (
+      email TEXT NOT NULL,
+      badge TEXT NOT NULL,
+      earned_at INTEGER NOT NULL,
+      seen_at INTEGER,
+      PRIMARY KEY (email, badge)
+    );
+    CREATE TABLE IF NOT EXISTS neerly_share_backs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_share_id INTEGER NOT NULL,
+      from_email TEXT NOT NULL,
+      new_share_id INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_sharebacks ON neerly_share_backs(original_share_id, from_email);
   `);
   // v0.4 columns on existing tables (added in place; existing data is kept)
   const addCol = (table, col, def) => {
@@ -129,6 +166,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_shares', 'distance_m', 'REAL NOT NULL DEFAULT 0');
   addCol('neerly_shares', 'link_views', 'INTEGER NOT NULL DEFAULT 0');
   addCol('neerly_update_requests', 'answered_at', 'INTEGER');
+  addCol('neerly_users', 'outfit', 'TEXT');          // v0.5: JSON {head, face, neck}
+  addCol('neerly_users', 'trail_style', 'TEXT');     // v0.5
+  addCol('neerly_users', 'app_icon', 'TEXT');        // v0.5: 'classic' | 'night'
+  addCol('neerly_users', 'referred_by', 'TEXT');     // v0.5: sender whose link brought them in
+  addCol('neerly_stats', 'share_backs', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_stats', 'night_shares', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_stats', 'early_shares', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_share_recipients', 'hidden', 'INTEGER NOT NULL DEFAULT 0'); // share-back: the address stays private
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -184,7 +229,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const q = {
     userByEmail:   db.prepare('SELECT * FROM neerly_users WHERE email = ?'),
-    insertUser:    db.prepare('INSERT INTO neerly_users (email, name, pw_hash, pw_salt, created_at, last_seen, username, avatar) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+    insertUser:    db.prepare('INSERT INTO neerly_users (email, name, pw_hash, pw_salt, created_at, last_seen, username, avatar, referred_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    setLook:       db.prepare('UPDATE neerly_users SET outfit = ?, trail_style = ?, app_icon = ? WHERE email = ?'),
+    friendsJoined: db.prepare('SELECT COUNT(*) n FROM neerly_users WHERE referred_by = ?'),
+    badges:        db.prepare('SELECT badge, earned_at, seen_at FROM neerly_badges WHERE email = ? ORDER BY earned_at, rowid'),
+    insertBadge:   db.prepare('INSERT OR IGNORE INTO neerly_badges (email, badge, earned_at) VALUES (?, ?, ?)'),
+    seeBadges:     db.prepare('UPDATE neerly_badges SET seen_at = ? WHERE email = ? AND seen_at IS NULL'),
+    statsNight:    db.prepare('UPDATE neerly_stats SET night_shares = night_shares + 1 WHERE email = ?'),
+    statsEarly:    db.prepare('UPDATE neerly_stats SET early_shares = early_shares + 1 WHERE email = ?'),
+    statsShareBack:db.prepare('UPDATE neerly_stats SET share_backs = share_backs + 1 WHERE email = ?'),
+    lastShareBack: db.prepare('SELECT created_at FROM neerly_share_backs WHERE original_share_id = ? AND from_email = ? ORDER BY created_at DESC LIMIT 1'),
+    insertShareBack: db.prepare('INSERT INTO neerly_share_backs (original_share_id, from_email, new_share_id, created_at) VALUES (?, ?, ?, ?)'),
     userByUsername:db.prepare('SELECT email FROM neerly_users WHERE username = ?'),
     usersNoUsername: db.prepare('SELECT email FROM neerly_users WHERE username IS NULL'),
     setUsername:   db.prepare('UPDATE neerly_users SET username = ? WHERE email = ?'),
@@ -235,7 +290,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     setLocation:   db.prepare('UPDATE neerly_shares SET lat = ?, lng = ?, accuracy = ?, loc_at = ? WHERE id = ?'),
     extendShare:   db.prepare('UPDATE neerly_shares SET expires_at = ? WHERE id = ?'),
 
-    insertRecipient: db.prepare('INSERT OR IGNORE INTO neerly_share_recipients (share_id, email, nickname, view_token) VALUES (?, ?, ?, ?)'),
+    insertRecipient: db.prepare('INSERT OR IGNORE INTO neerly_share_recipients (share_id, email, nickname, view_token, hidden) VALUES (?, ?, ?, ?, ?)'),
     recipients:    db.prepare('SELECT * FROM neerly_share_recipients WHERE share_id = ? ORDER BY id'),
     recipientByView: db.prepare('SELECT * FROM neerly_share_recipients WHERE share_id = ? AND view_token = ?'),
     markEmailed:   db.prepare('UPDATE neerly_share_recipients SET emailed = 1 WHERE id = ?'),
@@ -263,6 +318,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     db.prepare('DELETE FROM neerly_sessions WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_reset_tokens WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_stats WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_badges WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_share_backs WHERE from_email = ?').run(email);
+    db.prepare('UPDATE neerly_users SET referred_by = NULL WHERE referred_by = ?').run(email);
     db.prepare('DELETE FROM neerly_users WHERE email = ?').run(email);
   });
 
@@ -318,10 +376,54 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       requestsAnswered: s.requests_answered,
       streakWeeks: alive ? s.streak_weeks : 0,
       bestStreak: s.best_streak,
+      shareBacks: s.share_backs,
+      friendsJoined: q.friendsJoined.get(email).n,
+      nightShares: s.night_shares,
+      earlyShares: s.early_shares,
     };
   }
-  function countShareStart(email, t) {
+
+  // ── Badges + rewards ────────────────────────────────────────────────────────
+  // Awards any badge whose test now passes. Returns the ids newly earned.
+  function checkBadges(email) {
+    if (!q.userByEmail.get(email)) return [];
+    const st = statsFor(email);
+    const have = new Set(q.badges.all(email).map(b => b.badge));
+    const fresh = [];
+    const t = now();
+    for (const b of BADGES) if (!have.has(b.id) && b.test(st)) { q.insertBadge.run(email, b.id, t); fresh.push(b.id); }
+    if (fresh.length) console.log(`[neerly:badge] ${email} earned ${fresh.join(', ')}`);
+    return fresh;
+  }
+  function unlockedFor(email) {
+    const out = { head: [], face: [], neck: [], trail: [DEFAULT_TRAIL], icon: ['classic'] };
+    const earned = new Set(q.badges.all(email).map(b => b.badge));
+    for (const b of BADGES) if (earned.has(b.id)) out[b.reward.kind].push(b.reward.id);
+    return out;
+  }
+  function badgeView(email) {
+    return {
+      earned: q.badges.all(email).map(b => ({ id: b.badge, earnedAt: b.earned_at, seen: !!b.seen_at, reward: BADGES.find(x => x.id === b.badge)?.reward || null })),
+      total: BADGES.length, // the rest stay a surprise: the client shows only how many are left
+    };
+  }
+  function parseOutfit(json) { try { const o = JSON.parse(json || '{}'); return o && typeof o === 'object' ? o : {}; } catch { return {}; } }
+  // The look other people see: only items the user has actually unlocked.
+  function lookFor(u) {
+    if (!u) return { outfit: {}, trail: DEFAULT_TRAIL };
+    const un = unlockedFor(u.email);
+    const o = parseOutfit(u.outfit), outfit = {};
+    for (const slot of OUTFIT_SLOTS) if (o[slot] && un[slot].includes(o[slot])) outfit[slot] = o[slot];
+    return { outfit, trail: un.trail.includes(u.trail_style) ? u.trail_style : DEFAULT_TRAIL };
+  }
+  function countShareStart(email, t, tzOffsetMin) {
     q.ensureStats.run(email);
+    // Night Owl / Early Bird use the sender's own clock (the browser sends its UTC offset in minutes).
+    if (Number.isFinite(tzOffsetMin) && Math.abs(tzOffsetMin) <= 14 * 60) {
+      const hour = new Date(t - tzOffsetMin * 60000).getUTCHours();
+      if (hour >= 22 || hour < 4) q.statsNight.run(email);
+      else if (hour >= 5 && hour < 7) q.statsEarly.run(email);
+    }
     const s = q.stats.get(email);
     const w = weekIndex(t);
     let streak = s.streak_weeks;
@@ -345,6 +447,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         q.statsEnd.run(Math.max(0, endedAt - fresh.started_at) / 60000, fresh.distance_m || 0, fresh.sender_email);
       }
     })();
+    checkBadges(share.sender_email);
     anonViewers.delete(share.id);
     anonSeen.delete(share.id);
   }
@@ -390,7 +493,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return token;
   }
 
-  function publicUser(u) { return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null }; }
+  function publicUser(u) {
+    const look = lookFor(u);
+    return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null, outfit: look.outfit, trailStyle: look.trail, appIcon: u.app_icon === 'night' && unlockedFor(u.email).icon.includes('night') ? 'night' : 'classic' };
+  }
 
   // Returns the signed-in user or null. Bearer token in Authorization header.
   function authUser(req) {
@@ -439,14 +545,16 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return m >= 60 && m % 60 === 0 ? `${m / 60} hour${m === 60 ? '' : 's'}` : m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
 
-  function shareEmail(share, recipient) {
+  function shareEmail(share, recipient, isShareBack) {
     const link = `${PAGE_URL}?share=${share.token}&r=${recipient.view_token}`;
     const name = esc(share.sender_name);
+    const headline = isShareBack ? `${name} shared their location back 🧡` : `${name} is on the way 🧡`;
+    const subject = isShareBack ? `${share.sender_name} shared their location back` : `${share.sender_name} is on the way`;
     const html = emailShell(`
-      <p style="font-size:20px;font-weight:600;margin:0 0 8px">${name} is on the way 🧡</p>
+      <p style="font-size:20px;font-weight:600;margin:0 0 8px">${headline}</p>
       <p style="color:#6b5a50;margin:0 0 24px">Sharing live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to watch. No app or account needed.</p>
       ${button(link, 'Watch live →')}`);
-    return sendEmail(recipient.email, `${share.sender_name} is on the way`, html, link);
+    return sendEmail(recipient.email, subject, html, link);
   }
 
   function requestEmail(share, requesterName) {
@@ -478,6 +586,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return share;
   }
 
+  function maskEmail(e) { const [a, d] = String(e).split('@'); return `${a.slice(0, 1)}•••@${d || ''}`; }
+
   function recipientStatus(r) {
     if (r.last_ping_at && now() - r.last_ping_at < WATCHING_MS) return 'watching';
     if (r.opened_at) return 'viewed';
@@ -499,7 +609,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       maxExpiresAt: share.started_at + MAX_SHARE_MS,
       location: share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
       recipients: q.recipients.all(share.id).map(r => ({
-        email: r.email, nickname: r.nickname, status: recipientStatus(r), emailed: !!r.emailed,
+        email: r.hidden ? maskEmail(r.email) : r.email, nickname: r.nickname, hidden: !!r.hidden, status: recipientStatus(r), emailed: !!r.emailed,
         openedAt: r.opened_at, lastPingAt: r.last_ping_at,
       })),
       linkViewersWatching: anonWatching,
@@ -522,7 +632,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
     // ---- Auth ----
     if (p === '/neerly/auth/signup' && M === 'POST') {
-      const { name, email, password, username, avatar } = await readBody(req);
+      const { name, email, password, username, avatar, ref } = await readBody(req);
       const e = norm(email), n = clean(name, 40);
       if (!n) throw new HttpError(400, 'Please add your name');
       if (!isEmail(e)) throw new HttpError(400, 'That email doesn’t look right');
@@ -537,9 +647,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (usernameTaken(un)) return json(res, 409, { error: `@${un} is taken — how about @${suggestUsername(un)}?`, field: 'username', suggestion: suggestUsername(un) });
       } else un = suggestUsername(e); // recipient sign-up path has no username field
       const av = AVATARS.includes(avatar) ? avatar : null;
+      // v0.5: a sign-up that came through someone's share link counts toward their Connector badge.
+      const refShare = ref ? q.shareByToken.get(String(ref)) : null;
+      const referrer = refShare && refShare.sender_email !== e && q.userByEmail.get(refShare.sender_email) ? refShare.sender_email : null;
       const salt = randToken(16);
-      q.insertUser.run(e, n, hashPassword(password, salt), salt, now(), now(), un, av);
+      q.insertUser.run(e, n, hashPassword(password, salt), salt, now(), now(), un, av, referrer);
       q.ensureStats.run(e);
+      if (referrer) checkBadges(referrer);
       console.log(`[neerly:auth] signup ${e} @${un}`);
       return json(res, 200, { token: newSession(e), user: publicUser(q.userByEmail.get(e)) });
     }
@@ -588,7 +702,35 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (p === '/neerly/me' && M === 'GET') {
       const u = requireUser(req);
       const active = q.activeShareFor.get(u.email, now());
-      return json(res, 200, { user: publicUser(u), stats: statsFor(u.email), activeShare: active ? senderView(active) : null });
+      checkBadges(u.email); // catches badges earned while offline (e.g. watched counts, friends joining)
+      return json(res, 200, { user: publicUser(u), stats: statsFor(u.email), badges: badgeView(u.email), unlocked: unlockedFor(u.email), activeShare: active ? senderView(active) : null });
+    }
+
+    if (p === '/neerly/me/badges/seen' && M === 'POST') {
+      const u = requireUser(req);
+      q.seeBadges.run(now(), u.email);
+      return json(res, 200, { badges: badgeView(u.email) });
+    }
+
+    // v0.5: outfit, trail style and app icon — only unlocked items are accepted.
+    if (p === '/neerly/me/look' && M === 'POST') {
+      const u = requireUser(req);
+      const body = await readBody(req);
+      const un = unlockedFor(u.email);
+      const cur = parseOutfit(u.outfit);
+      const outfit = {};
+      for (const slot of OUTFIT_SLOTS) {
+        const v = body.outfit && slot in body.outfit ? body.outfit[slot] : cur[slot];
+        if (v == null || v === '') continue;
+        if (!un[slot].includes(v)) throw new HttpError(400, 'That item isn’t unlocked yet');
+        outfit[slot] = v;
+      }
+      const trail = body.trailStyle !== undefined ? body.trailStyle : (u.trail_style || DEFAULT_TRAIL);
+      if (!un.trail.includes(trail)) throw new HttpError(400, 'That trail isn’t unlocked yet');
+      const icon = body.appIcon !== undefined ? body.appIcon : (u.app_icon || 'classic');
+      if (!un.icon.includes(icon)) throw new HttpError(400, 'That icon isn’t unlocked yet');
+      q.setLook.run(JSON.stringify(outfit), trail, icon, u.email);
+      return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
     }
 
     // Username check / suggestion. ?u= checks a wanted name; ?email= suggests one from an email.
@@ -679,7 +821,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     // ---- Create share ----
     if (p === '/neerly/shares' && M === 'POST') {
       const u = requireUser(req);
-      const { minutes, recipients, lat, lng, accuracy } = await readBody(req);
+      const { minutes, recipients, lat, lng, accuracy, shareBack, tzOffset } = await readBody(req);
       if (!DURATIONS.includes(Number(minutes))) throw new HttpError(400, 'Pick 15 min, 30 min or 1 hour');
       if (!validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
       const list = Array.isArray(recipients) ? recipients : [];
@@ -689,7 +831,24 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const e = norm(r?.email);
         if (!isEmail(e) || e === u.email || seen.has(e)) continue;
         seen.add(e);
-        rs.push({ email: e, nickname: clean(r?.nickname, 40) || null });
+        rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0 });
+      }
+      // v0.5 one-tap share back: the server looks up the original sender, so their
+      // address is never shown to whoever holds the link. It isn't saved as a contact either.
+      let original = null, countBack = false;
+      if (shareBack) {
+        original = q.shareByToken.get(String(shareBack));
+        if (!original) throw new HttpError(404, 'That share link doesn’t exist anymore');
+        if (original.sender_email === u.email) throw new HttpError(400, 'That’s your own share');
+        const refTime = original.ended_at || original.expires_at;
+        if (now() - Math.min(refTime, now()) > SHARE_BACK_WINDOW) throw new HttpError(410, 'That share is too old to share back to. Start a new share instead.');
+        const last = q.lastShareBack.get(original.id, u.email);
+        if (last && now() - last.created_at < SHARE_BACK_COOLDOWN) throw new HttpError(429, `You just shared back with ${original.sender_name}. Give it a few minutes.`);
+        countBack = !last; // share-backs count once per original share
+        const e = original.sender_email;
+        const i = rs.findIndex(r => r.email === e);
+        if (i >= 0) rs.splice(i, 1);
+        rs.unshift({ email: e, nickname: original.sender_name, hidden: 1 });
       }
       if (rs.length > MAX_RECIPIENTS) throw new HttpError(400, `Up to ${MAX_RECIPIENTS} people per share`);
       // Recipients are optional: a link-only share (pasted into WhatsApp) is fine.
@@ -701,20 +860,25 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const info = q.insertShare.run(token, u.email, u.name, t, t + Number(minutes) * 60000,
           Number(lat), Number(lng), numOrNull(accuracy), t);
         addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
-        countShareStart(u.email, t);
+        countShareStart(u.email, t, Number(tzOffset));
         for (const r of rs) {
-          q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12));
-          q.upsertContact.run(u.email, r.email, r.nickname, t); // remember for next time
+          q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12), r.hidden);
+          if (!r.hidden) q.upsertContact.run(u.email, r.email, r.nickname, t); // remember for next time
+        }
+        if (original) {
+          q.insertShareBack.run(original.id, u.email, info.lastInsertRowid, t);
+          if (countBack) q.statsShareBack.run(u.email);
         }
         return q.shareByToken.get(token);
       })();
+      const newBadges = checkBadges(u.email);
 
       // Email in the background so the sender's screen isn't waiting on Resend.
       for (const r of q.recipients.all(created.id)) {
-        shareEmail(created, r).then(ok => { if (ok) q.markEmailed.run(r.id); });
+        shareEmail(created, r, !!r.hidden && !!original).then(ok => { if (ok) q.markEmailed.run(r.id); });
       }
-      console.log(`[neerly:share] ${u.email} started ${minutes}m share ${token} → ${rs.length} recipient(s)`);
-      return json(res, 200, { share: senderView(created) });
+      console.log(`[neerly:share] ${u.email} started ${minutes}m share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
+      return json(res, 200, { share: senderView(created), newBadges, shareBackTo: original ? original.sender_name : null });
     }
 
     // ---- Share sub-routes ----
@@ -734,7 +898,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (r) {
           recipient = q.recipientByView.get(share.id, r);
           if (recipient && active) {
-            if (!recipient.opened_at) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); }
+            if (!recipient.opened_at) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email); }
             q.pingRecipient.run(now(), now(), recipient.id);
           }
         } else if (viewer && active && /^[A-Za-z0-9_-]{6,40}$/.test(viewer)) {
@@ -745,7 +909,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           if (!seen.has(viewer) && seen.size < 500) {
             seen.add(viewer);
             q.incLinkViews.run(share.id);
-            q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email);
+            q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email);
           }
         }
         const sender = q.userByEmail.get(share.sender_email);
@@ -753,6 +917,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           share: {
             senderName: share.sender_name,
             senderAvatar: sender?.avatar || null,
+            senderOutfit: lookFor(sender).outfit,
+            senderTrail: lookFor(sender).trail,
+            canShareBack: now() - Math.min(share.ended_at || share.expires_at, now()) <= SHARE_BACK_WINDOW,
             active,
             startedAt: share.started_at,
             expiresAt: share.expires_at,
