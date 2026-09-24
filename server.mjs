@@ -14,7 +14,7 @@ const PURGE_INTERVAL = 60 * 1000;
 const TOKEN_EXPIRY_MS = 15 * 60 * 1000; // 15 minutes
 
 // ── Database setup ─────────────────────────────────────────────────────────
-const db = new Database('orbyt.db');
+const db = new Database(process.env.DB_PATH || 'orbyt.db'); // on Render: DB_PATH=/var/data/orbyt.db (persistent disk)
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
