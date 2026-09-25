@@ -63,6 +63,10 @@ const WEATHER_API = process.env.WEATHER_API || 'https://api.open-meteo.com/v1/fo
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   const PAGE_URL = process.env.NEERLY_URL || `${appUrl.replace(/\/$/, '')}/neerly.html`;
+  // v0.6: Right now shares link to neerly-now.html, a tiny page with its own link preview
+  // ("What I'm up to") that forwards straight to neerly.html with the same query string.
+  const NOW_PAGE_URL = PAGE_URL.replace(/neerly\.html$/, 'neerly-now.html');
+  const shareBase = (share) => (share.mode === 'now' && NOW_PAGE_URL !== PAGE_URL ? NOW_PAGE_URL : PAGE_URL);
   const FROM = process.env.NEERLY_FROM_EMAIL || fromEmail || 'Neerly <onboarding@resend.dev>';
   const PEPPER = process.env.PASSWORD_SALT || '';
   if (!PEPPER) console.warn('[neerly] PASSWORD_SALT not set — add it in Render before real users sign up');
@@ -601,7 +605,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   };
 
   function shareEmail(share, recipient, isShareBack) {
-    const link = `${PAGE_URL}?share=${share.token}&r=${recipient.view_token}`;
+    const link = `${shareBase(share)}?share=${share.token}&r=${recipient.view_token}`;
     const t = shareTitle(share, isShareBack);
     const html = emailShell(`
       <p style="font-size:20px;font-weight:600;margin:0 0 8px">${esc(t)} 🧡</p>
@@ -668,7 +672,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (anon) for (const [, ts] of anon) if (t - ts < WATCHING_MS) anonWatching++;
     return {
       token: share.token,
-      link: `${PAGE_URL}?share=${share.token}`,
+      link: `${shareBase(share)}?share=${share.token}`,
       active: isActive(share),
       startedAt: share.started_at,
       expiresAt: share.expires_at,
