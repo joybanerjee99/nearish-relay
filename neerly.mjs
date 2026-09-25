@@ -1,6 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Neerly — "I'm on my way."
-// Time-boxed, sender-initiated live location sharing. v0 = Quick Share only.
+// Time-boxed, sender-initiated live location sharing.
+// v0.6: two share modes — 'way' (On my way: live trail) and 'now' (Right now: a status,
+// optionally with a pin, never a trail) — plus a weather look for the buddy.
 //
 // Mounted on the existing nearish-relay HTTP server. Every route lives under
 // /neerly/... and every table is prefixed neerly_ so nothing collides with
@@ -50,6 +52,14 @@ const OUTFIT_SLOTS = ['head', 'face', 'neck'];
 const DEFAULT_TRAIL = 'dots';
 const SHARE_BACK_WINDOW = 24 * 60 * 60 * 1000;   // you can share back up to a day after their share
 const SHARE_BACK_COOLDOWN = 10 * 60 * 1000;      // and not more than once per 10 minutes per share
+// v0.6 — share modes. 'way' = On my way (live trail). 'now' = Right now (status text, location optional, no trail).
+const MODES = ['way', 'now'];
+const NOW_DURATIONS = [30, 60, 120, 240];        // Right now statuses tend to last longer
+const NOTE_MAX = 60;                             // "Heading to…" / status text
+// v0.6 — weather for the buddy's look. Coordinates are rounded (~1 km) before asking; the result lives
+// on the share row and is wiped with the location when the share ends.
+const WEATHER_TTL = 15 * 60 * 1000;
+const WEATHER_API = process.env.WEATHER_API || 'https://api.open-meteo.com/v1/forecast';
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   const PAGE_URL = process.env.NEERLY_URL || `${appUrl.replace(/\/$/, '')}/neerly.html`;
@@ -174,6 +184,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_stats', 'night_shares', 'INTEGER NOT NULL DEFAULT 0');
   addCol('neerly_stats', 'early_shares', 'INTEGER NOT NULL DEFAULT 0');
   addCol('neerly_share_recipients', 'hidden', 'INTEGER NOT NULL DEFAULT 0'); // share-back: the address stays private
+  addCol('neerly_shares', 'mode', "TEXT NOT NULL DEFAULT 'way'");   // v0.6: 'way' | 'now'
+  addCol('neerly_shares', 'note', 'TEXT');                           // v0.6: "Heading to…" or the status
+  addCol('neerly_shares', 'show_loc', 'INTEGER NOT NULL DEFAULT 1');  // v0.6: Right now can hide the location
+  addCol('neerly_shares', 'weather', 'TEXT');                        // v0.6: JSON, wiped with the location
+  addCol('neerly_shares', 'weather_at', 'INTEGER');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -261,11 +276,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     contactByEmail:db.prepare('SELECT id, email, nickname FROM neerly_contacts WHERE owner_email = ? AND email = ?'),
     delContact:    db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ? AND id = ?'),
 
-    insertShare:   db.prepare('INSERT INTO neerly_shares (token, sender_email, sender_name, started_at, expires_at, lat, lng, accuracy, loc_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    insertShare:   db.prepare('INSERT INTO neerly_shares (token, sender_email, sender_name, started_at, expires_at, lat, lng, accuracy, loc_at, mode, note, show_loc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    setNote:       db.prepare('UPDATE neerly_shares SET note = ? WHERE id = ?'),
+    setWeather:    db.prepare('UPDATE neerly_shares SET weather = ?, weather_at = ? WHERE id = ? AND ended_at IS NULL'),
     shareByToken:  db.prepare('SELECT * FROM neerly_shares WHERE token = ?'),
     activeShareFor:db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL AND expires_at > ? ORDER BY started_at DESC LIMIT 1'),
-    endShare:      db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL WHERE id = ? AND ended_at IS NULL'),
-    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL WHERE id = ?'),
+    endShare:      db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL WHERE id = ? AND ended_at IS NULL'),
+    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL WHERE id = ?'),
     openSharesFor: db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL'),
     expiredOpen:   db.prepare('SELECT * FROM neerly_shares WHERE ended_at IS NULL AND expires_at <= ?'),
     shareById:     db.prepare('SELECT * FROM neerly_shares WHERE id = ?'),
@@ -487,6 +504,44 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     };
   }
 
+  // ── v0.6 Weather ────────────────────────────────────────────────────────────
+  // WMO weather codes → a few conditions the buddy can dress for.
+  function weatherKind(code) {
+    if ([95, 96, 99].includes(code)) return 'storm';
+    if ((code >= 71 && code <= 77) || code === 85 || code === 86) return 'snow';
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return 'rain';
+    if (code === 45 || code === 48) return 'fog';
+    if (code === 2 || code === 3) return 'cloud';
+    return 'clear';
+  }
+  const weatherInFlight = new Set();
+  // Fire-and-forget: refreshes the share's weather if it's stale. Never blocks a response.
+  function refreshWeather(share) {
+    if (!share || share.lat == null || !isActive(share) || weatherInFlight.has(share.id)) return;
+    const lat = Math.round(share.lat * 100) / 100, lng = Math.round(share.lng * 100) / 100;
+    if (share.weather_at && now() - share.weather_at < WEATHER_TTL) {
+      // Fresh enough, unless they've moved a few km since (a train or a drive).
+      let at = null; try { at = JSON.parse(share.weather || 'null'); } catch {}
+      if (!at || at.lat == null || Math.abs(at.lat - lat) + Math.abs(at.lng - lng) < 0.05) return;
+    }
+    weatherInFlight.add(share.id);
+    const url = `${WEATHER_API}?latitude=${lat}&longitude=${lng}&current=temperature_2m,weather_code,is_day&timezone=auto`;
+    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 6000);
+    fetch(url, { signal: ctl.signal })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        const c = d?.current; if (!c || !Number.isFinite(c.temperature_2m)) return;
+        const w = { kind: weatherKind(Number(c.weather_code)), tempC: Math.round(c.temperature_2m), isDay: c.is_day !== 0, lat, lng };
+        q.setWeather.run(JSON.stringify(w), now(), share.id);
+      })
+      .catch(() => {})
+      .finally(() => { clearTimeout(to); weatherInFlight.delete(share.id); });
+  }
+  function weatherOf(share) {
+    if (!isActive(share) || share.lat == null || !share.weather) return null;
+    try { const w = JSON.parse(share.weather); return { kind: w.kind, tempC: w.tempC, isDay: w.isDay }; } catch { return null; }
+  }
+
   function newSession(email) {
     const token = randToken(32);
     q.insertSession.run(token, email, now() + SESSION_MS);
@@ -547,14 +602,26 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
   function shareEmail(share, recipient, isShareBack) {
     const link = `${PAGE_URL}?share=${share.token}&r=${recipient.view_token}`;
-    const name = esc(share.sender_name);
-    const headline = isShareBack ? `${name} shared their location back 🧡` : `${name} is on the way 🧡`;
-    const subject = isShareBack ? `${share.sender_name} shared their location back` : `${share.sender_name} is on the way`;
+    const t = shareTitle(share, isShareBack);
     const html = emailShell(`
-      <p style="font-size:20px;font-weight:600;margin:0 0 8px">${headline}</p>
-      <p style="color:#6b5a50;margin:0 0 24px">Sharing live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to watch. No app or account needed.</p>
-      ${button(link, 'Watch live →')}`);
+      <p style="font-size:20px;font-weight:600;margin:0 0 8px">${esc(t)} 🧡</p>
+      <p style="color:#6b5a50;margin:0 0 24px">${share.mode === 'now'
+        ? `Live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to see${share.show_loc ? ' where they are' : ''}. No app or account needed.`
+        : `Sharing live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to watch. No app or account needed.`}</p>
+      ${button(link, share.mode === 'now' ? 'See it live →' : 'Watch live →')}`);
+    const subject = t;
     return sendEmail(recipient.email, subject, html, link);
+  }
+
+  // One line that says what this share is: used for email subjects and headlines.
+  function shareTitle(share, isShareBack) {
+    const n = share.sender_name;
+    if (share.mode === 'now') {
+      if (isShareBack) return share.note ? `${n} shared back: ${share.note}` : `${n} shared back where they are`;
+      return share.note ? `${n}: ${share.note}` : share.show_loc ? `${n} shared where they are` : `${n} shared what they're up to`;
+    }
+    if (isShareBack) return `${n} shared their location back`;
+    return share.note ? `${n} is on the way to ${share.note}` : `${n} is on the way`;
   }
 
   function requestEmail(share, requesterName) {
@@ -607,6 +674,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       expiresAt: share.expires_at,
       endedAt: share.ended_at,
       maxExpiresAt: share.started_at + MAX_SHARE_MS,
+      mode: share.mode || 'way',
+      note: share.note || '',
+      showLocation: !!share.show_loc,
+      weather: weatherOf(share),
       location: share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
       recipients: q.recipients.all(share.id).map(r => ({
         email: r.hidden ? maskEmail(r.email) : r.email, nickname: r.nickname, hidden: !!r.hidden, status: recipientStatus(r), emailed: !!r.emailed,
@@ -617,6 +688,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       ...(isActive(share) ? trailSlice(share.id, trailFrom) : { trail: [], trailFrom: 0, trailCount: 0 }),
       summary: isActive(share) ? null : shareSummary(share),
     };
+  }
+  function durationsFor(mode) { return mode === 'now' ? NOW_DURATIONS : DURATIONS; }
+  function durationError(mode) { return mode === 'now' ? 'Pick 30 min, 1 hour, 2 hours or 4 hours' : 'Pick 15 min, 30 min or 1 hour'; }
+  function cleanNote(v) { return String(v ?? '').replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, NOTE_MAX);
   }
 
   function loadOwnedShare(token, user) {
@@ -821,9 +896,15 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     // ---- Create share ----
     if (p === '/neerly/shares' && M === 'POST') {
       const u = requireUser(req);
-      const { minutes, recipients, lat, lng, accuracy, shareBack, tzOffset } = await readBody(req);
-      if (!DURATIONS.includes(Number(minutes))) throw new HttpError(400, 'Pick 15 min, 30 min or 1 hour');
-      if (!validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
+      const { minutes, recipients, lat, lng, accuracy, shareBack, tzOffset, mode: rawMode, note: rawNote, showLocation } = await readBody(req);
+      // v0.6: mode defaults to 'way' so older pages keep working.
+      const mode = rawMode == null ? 'way' : String(rawMode);
+      if (!MODES.includes(mode)) throw new HttpError(400, 'Unknown share mode');
+      const note = cleanNote(rawNote) || null;
+      const showLoc = mode === 'way' ? true : showLocation !== false; // On my way always shows the map
+      if (!durationsFor(mode).includes(Number(minutes))) throw new HttpError(400, durationError(mode));
+      if (showLoc && !validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
+      if (mode === 'now' && !showLoc && !note) throw new HttpError(400, 'Add what you’re up to, or show where you are');
       const list = Array.isArray(recipients) ? recipients : [];
       const seen = new Set();
       const rs = [];
@@ -857,9 +938,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const token = randToken(18);
       for (const old of q.openSharesFor.all(u.email)) finalizeShare(old, t); // one live share at a time
       const created = db.transaction(() => {
+        // A hidden location is never stored, not even for a moment.
         const info = q.insertShare.run(token, u.email, u.name, t, t + Number(minutes) * 60000,
-          Number(lat), Number(lng), numOrNull(accuracy), t);
-        addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
+          showLoc ? Number(lat) : null, showLoc ? Number(lng) : null, showLoc ? numOrNull(accuracy) : null, showLoc ? t : null,
+          mode, note, showLoc ? 1 : 0);
+        if (mode === 'way') addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
         countShareStart(u.email, t, Number(tzOffset));
         for (const r of rs) {
           q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12), r.hidden);
@@ -872,12 +955,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         return q.shareByToken.get(token);
       })();
       const newBadges = checkBadges(u.email);
+      refreshWeather(created);
 
       // Email in the background so the sender's screen isn't waiting on Resend.
       for (const r of q.recipients.all(created.id)) {
         shareEmail(created, r, !!r.hidden && !!original).then(ok => { if (ok) q.markEmailed.run(r.id); });
       }
-      console.log(`[neerly:share] ${u.email} started ${minutes}m share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
+      console.log(`[neerly:share] ${u.email} started ${minutes}m ${mode}${showLoc ? '' : ' (no location)'} share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
       return json(res, 200, { share: senderView(created), newBadges, shareBackTo: original ? original.sender_name : null });
     }
 
@@ -913,9 +997,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           }
         }
         const sender = q.userByEmail.get(share.sender_email);
+        refreshWeather(share);
         return json(res, 200, {
           share: {
             senderName: share.sender_name,
+            mode: share.mode || 'way',
+            note: share.note || '',
+            showLocation: !!share.show_loc,
+            weather: weatherOf(share),
             senderAvatar: sender?.avatar || null,
             senderOutfit: lookFor(sender).outfit,
             senderTrail: lookFor(sender).trail,
@@ -936,7 +1025,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
       if (action === 'status' && M === 'GET') {
         const u = requireUser(req);
-        return json(res, 200, { share: senderView(loadOwnedShare(token, u), url.searchParams.get('t')) });
+        const share = loadOwnedShare(token, u);
+        refreshWeather(share);
+        return json(res, 200, { share: senderView(share, url.searchParams.get('t')) });
       }
 
       if (action === 'location' && M === 'POST') {
@@ -944,13 +1035,28 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const share = loadOwnedShare(token, u);
         if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
         const { lat, lng, accuracy, trailFrom } = await readBody(req);
+        // Right now with the location hidden: nothing is stored, whatever the page sends.
+        if (!share.show_loc) return json(res, 200, { share: senderView(share, trailFrom) });
         if (!validCoord(lat, lng)) throw new HttpError(400, 'Invalid location');
         const t = now();
         db.transaction(() => {
           q.setLocation.run(Number(lat), Number(lng), numOrNull(accuracy), t, share.id);
-          addTrailPoint(share.id, Number(lat), Number(lng), numOrNull(accuracy), t);
+          if ((share.mode || 'way') === 'way') addTrailPoint(share.id, Number(lat), Number(lng), numOrNull(accuracy), t);
         })();
-        return json(res, 200, { share: senderView(q.shareByToken.get(token), trailFrom) });
+        const fresh = q.shareByToken.get(token);
+        refreshWeather(fresh);
+        return json(res, 200, { share: senderView(fresh, trailFrom) });
+      }
+
+      // v0.6: change the "Heading to…" / status text while the share runs.
+      if (action === 'note' && M === 'POST') {
+        const u = requireUser(req);
+        const share = loadOwnedShare(token, u);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
+        const note = cleanNote((await readBody(req)).note) || null;
+        if (!note && share.mode === 'now' && !share.show_loc) throw new HttpError(400, 'Add what you’re up to');
+        q.setNote.run(note, share.id);
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
       }
 
       if (action === 'extend' && M === 'POST') {
@@ -958,7 +1064,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const share = loadOwnedShare(token, u);
         if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
         const { minutes } = await readBody(req);
-        if (!DURATIONS.includes(Number(minutes))) throw new HttpError(400, 'Extend by 15 min, 30 min or 1 hour');
+        if (![...DURATIONS, ...NOW_DURATIONS].includes(Number(minutes))) throw new HttpError(400, 'Extend by 15 min, 30 min or 1 hour');
         const cap = share.started_at + MAX_SHARE_MS;
         const next = Math.min(share.expires_at + Number(minutes) * 60000, cap);
         if (next <= share.expires_at) throw new HttpError(400, 'Shares can run up to 4 hours in total');
