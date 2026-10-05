@@ -3,6 +3,8 @@
 // Time-boxed, sender-initiated live location sharing.
 // v0.6: two share modes — 'way' (On my way: live trail) and 'now' (Right now: a status,
 // optionally with a pin, never a trail) — plus a weather look for the buddy.
+// v0.7a: the Watching map (every live share sent to you, in one place) and email confirmation,
+// which the Watching map needs: shares are matched to accounts by email address.
 //
 // Mounted on the existing nearish-relay HTTP server. Every route lives under
 // /neerly/... and every table is prefixed neerly_ so nothing collides with
@@ -52,6 +54,9 @@ const OUTFIT_SLOTS = ['head', 'face', 'neck'];
 const DEFAULT_TRAIL = 'dots';
 const SHARE_BACK_WINDOW = 24 * 60 * 60 * 1000;   // you can share back up to a day after their share
 const SHARE_BACK_COOLDOWN = 10 * 60 * 1000;      // and not more than once per 10 minutes per share
+// v0.7a — email confirmation (the Watching map lists shares sent to your address, so it has to be yours)
+const VERIFY_MS          = 24 * 60 * 60 * 1000;  // a confirmation link works for a day
+const VERIFY_COOLDOWN    = 2 * 60 * 1000;        // one confirmation email per 2 minutes
 // v0.6 — share modes. 'way' = On my way (live trail). 'now' = Right now (status text, location optional, no trail).
 const MODES = ['way', 'now'];
 const NOW_DURATIONS = [30, 60, 120, 240];        // Right now statuses tend to last longer
@@ -62,10 +67,12 @@ const WEATHER_TTL = 15 * 60 * 1000;
 const WEATHER_API = process.env.WEATHER_API || 'https://api.open-meteo.com/v1/forecast';
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
+  // NEERLY_URL is where emailed links point: the page itself (…/neerly.html) or, from v0.7a, the
+  // site root (https://neerly.net/). Without it, links fall back to APP_URL + /neerly.html.
   const PAGE_URL = process.env.NEERLY_URL || `${appUrl.replace(/\/$/, '')}/neerly.html`;
   // v0.6: Right now shares link to neerly-now.html, a tiny page with its own link preview
-  // ("What I'm up to") that forwards straight to neerly.html with the same query string.
-  const NOW_PAGE_URL = PAGE_URL.replace(/neerly\.html$/, 'neerly-now.html');
+  // ("What I'm up to") that forwards straight to the app with the same query string.
+  const NOW_PAGE_URL = /\/$/.test(PAGE_URL) ? PAGE_URL + 'neerly-now.html' : PAGE_URL.replace(/neerly\.html$/, 'neerly-now.html');
   const shareBase = (share) => (share.mode === 'now' && NOW_PAGE_URL !== PAGE_URL ? NOW_PAGE_URL : PAGE_URL);
   const FROM = process.env.NEERLY_FROM_EMAIL || fromEmail || 'Neerly <onboarding@resend.dev>';
   const PEPPER = process.env.PASSWORD_SALT || '';
@@ -170,6 +177,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_sharebacks ON neerly_share_backs(original_share_id, from_email);
+    -- v0.7a: email confirmation links
+    CREATE TABLE IF NOT EXISTS neerly_verify_tokens (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_recipients_email ON neerly_share_recipients(email);
   `);
   // v0.4 columns on existing tables (added in place; existing data is kept)
   const addCol = (table, col, def) => {
@@ -193,6 +208,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_shares', 'show_loc', 'INTEGER NOT NULL DEFAULT 1');  // v0.6: Right now can hide the location
   addCol('neerly_shares', 'weather', 'TEXT');                        // v0.6: JSON, wiped with the location
   addCol('neerly_shares', 'weather_at', 'INTEGER');
+  addCol('neerly_users', 'email_verified_at', 'INTEGER');            // v0.7a: set by a confirmation link or a password reset
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -320,6 +336,18 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     lastRequest:   db.prepare('SELECT created_at FROM neerly_update_requests WHERE share_id = ? AND requester_email = ? ORDER BY created_at DESC LIMIT 1'),
     insertRequest: db.prepare('INSERT INTO neerly_update_requests (share_id, requester_email, requester_name, created_at) VALUES (?, ?, ?, ?)'),
 
+    // v0.7a — Watching: live shares sent to this address (one per sender: a sender has one live share at a time)
+    watchingFor:   db.prepare(`SELECT s.*, r.id AS rid, r.view_token AS r_view, r.opened_at AS r_opened
+                               FROM neerly_share_recipients r JOIN neerly_shares s ON s.id = r.share_id
+                               WHERE r.email = ? AND s.ended_at IS NULL AND s.expires_at > ? AND s.sender_email != ?
+                               ORDER BY s.started_at DESC`),
+    setVerified:   db.prepare('UPDATE neerly_users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE email = ?'),
+    insertVerify:  db.prepare('INSERT INTO neerly_verify_tokens (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)'),
+    lastVerify:    db.prepare('SELECT created_at FROM neerly_verify_tokens WHERE email = ? ORDER BY created_at DESC LIMIT 1'),
+    verifyToken:   db.prepare('SELECT * FROM neerly_verify_tokens WHERE token = ? AND expires_at > ?'),
+    delVerifyFor:  db.prepare('DELETE FROM neerly_verify_tokens WHERE email = ?'),
+    purgeVerify:   db.prepare('DELETE FROM neerly_verify_tokens WHERE expires_at < ?'),
+
     purgeSessions: db.prepare('DELETE FROM neerly_sessions WHERE expires_at < ?'),
     purgeResets:   db.prepare('DELETE FROM neerly_reset_tokens WHERE expires_at < ? OR used = 1'),
   };
@@ -338,6 +366,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ?').run(email);
     db.prepare('DELETE FROM neerly_sessions WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_reset_tokens WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_verify_tokens WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_stats WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_badges WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_share_backs WHERE from_email = ?').run(email);
@@ -554,7 +583,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
   function publicUser(u) {
     const look = lookFor(u);
-    return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null, outfit: look.outfit, trailStyle: look.trail, appIcon: u.app_icon === 'night' && unlockedFor(u.email).icon.includes('night') ? 'night' : 'classic' };
+    return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null, outfit: look.outfit, trailStyle: look.trail, appIcon: u.app_icon === 'night' && unlockedFor(u.email).icon.includes('night') ? 'night' : 'classic',
+      emailVerified: !!u.email_verified_at };
   }
 
   // Returns the signed-in user or null. Bearer token in Authorization header.
@@ -644,6 +674,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       ${button(link, 'Set a new password →')}
       <p style="color:#9a8a80;font-size:13px;margin-top:24px">Didn't ask for this? You can ignore it.</p>`);
     return sendEmail(email, 'Reset your Neerly password', html, link);
+  }
+
+  // v0.7a — "confirm your email": the Watching map only lists shares for a confirmed address.
+  function verifyEmail(email, token) {
+    const link = `${PAGE_URL}?verify=${token}`;
+    const html = emailShell(`
+      <p style="font-size:20px;font-weight:600;margin:0 0 8px">Confirm your email</p>
+      <p style="color:#6b5a50;margin:0 0 24px">Tap below so Neerly can show you the friends who share their location with this address. The link works for 24 hours.</p>
+      ${button(link, 'Confirm my email →')}
+      <p style="color:#9a8a80;font-size:13px;margin-top:24px">Didn't ask for this? You can ignore it.</p>`);
+    return sendEmail(email, 'Confirm your email for Neerly', html, link);
   }
 
   // ── Share views ───────────────────────────────────────────────────────────
@@ -773,6 +814,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const salt = randToken(16);
       q.setPassword.run(hashPassword(password, salt), salt, row.email);
       q.useReset.run(row.token);
+      q.setVerified.run(now(), row.email); // v0.7a: the reset link reached their inbox, so the address is theirs
       q.delSessionsFor.run(row.email); // sign out everywhere else
       const u = q.userByEmail.get(row.email);
       return json(res, 200, { token: newSession(u.email), user: publicUser(u) });
@@ -783,6 +825,61 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const active = q.activeShareFor.get(u.email, now());
       checkBadges(u.email); // catches badges earned while offline (e.g. watched counts, friends joining)
       return json(res, 200, { user: publicUser(u), stats: statsFor(u.email), badges: badgeView(u.email), unlocked: unlockedFor(u.email), activeShare: active ? senderView(active) : null });
+    }
+
+    // ---- v0.7a: email confirmation ----
+    if (p === '/neerly/me/verify-email' && M === 'POST') {
+      const u = requireUser(req);
+      if (u.email_verified_at) return json(res, 200, { ok: true, alreadyVerified: true });
+      const last = q.lastVerify.get(u.email);
+      if (last && now() - last.created_at < VERIFY_COOLDOWN) return json(res, 200, { ok: true, recentlySent: true });
+      const token = randToken(32);
+      q.insertVerify.run(token, u.email, now(), now() + VERIFY_MS);
+      await verifyEmail(u.email, token);
+      return json(res, 200, { ok: true });
+    }
+    if (p === '/neerly/auth/verify' && M === 'POST') {
+      // No sign-in needed: the link may be opened on another device. It only confirms the address.
+      const { token } = await readBody(req);
+      const row = q.verifyToken.get(String(token || ''), now());
+      if (!row) throw new HttpError(400, 'That confirmation link has expired. Send a new one from the Watching tab.');
+      q.setVerified.run(now(), row.email);
+      q.delVerifyFor.run(row.email);
+      console.log(`[neerly:auth] email confirmed ${row.email}`);
+      const me = authUser(req);
+      return json(res, 200, { ok: true, email: row.email, user: me && me.email === row.email ? publicUser(q.userByEmail.get(me.email)) : null });
+    }
+
+    // ---- v0.7a: Watching — every live share sent to me, for one map ----
+    // ?look=1 means the Watching tab is open, so the senders see this person as watching.
+    // Without it (the tab badge checking in the background) nothing is marked.
+    if (p === '/neerly/watching' && M === 'GET') {
+      const u = requireUser(req);
+      if (!u.email_verified_at) return json(res, 403, { error: 'Confirm your email to see who’s sharing with you', needsVerify: true });
+      const look = url.searchParams.get('look') === '1';
+      const t = now();
+      const bySender = new Map();
+      for (const row of q.watchingFor.all(u.email, t, u.email)) if (!bySender.has(row.sender_email)) bySender.set(row.sender_email, row);
+      const friends = [];
+      for (const share of bySender.values()) {
+        if (look) {
+          if (!share.r_opened) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email); }
+          q.pingRecipient.run(t, t, share.rid);
+          refreshWeather(share);
+        }
+        const sender = q.userByEmail.get(share.sender_email);
+        const look2 = lookFor(sender);
+        friends.push({
+          token: share.token, r: share.r_view,
+          name: share.sender_name, username: sender?.username || null,
+          avatar: sender?.avatar || null, outfit: look2.outfit,
+          mode: share.mode || 'way', note: share.note || '', showLocation: !!share.show_loc,
+          weather: weatherOf(share),
+          location: share.show_loc && share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
+          startedAt: share.started_at, expiresAt: share.expires_at,
+        });
+      }
+      return json(res, 200, { friends });
     }
 
     if (p === '/neerly/me/badges/seen' && M === 'POST') {
@@ -1143,6 +1240,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (n) console.log(`[neerly:sweep] expired ${n} share(s), location wiped`);
     q.purgeSessions.run(t);
     q.purgeResets.run(t);
+    q.purgeVerify.run(t);
     for (const [shareId, viewers] of anonViewers) {
       for (const [v, ts] of viewers) if (t - ts > WATCHING_MS * 3) viewers.delete(v);
       if (!viewers.size) anonViewers.delete(shareId);
