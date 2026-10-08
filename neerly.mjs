@@ -26,7 +26,7 @@ const MAX_BODY          = 32 * 1024;
 const REQUEST_ANSWER_MS = 24 * 60 * 60 * 1000;       // a share within 24h of a request counts as answering it
 const WEEK_MS           = 7 * 24 * 60 * 60 * 1000;
 // Buddy avatars (the drawings live in neerly.html; the server only checks the id).
-const AVATARS = ['cat','pup','bunny','fox','bear','panda','owl','frog','dragon','unicorn','ghost','robot'];
+const AVATARS = ['cat','pup','bunny','fox','bear','panda','owl','frog','dragon','unicorn','ghost','robot','suitm','suitf','wolf','lion'];
 const RESERVED_USERNAMES = new Set(['neerly','admin','administrator','support','help','root','me','api','system','official','staff','team','moderator','null','undefined']);
 // Trail: skip fuzzy fixes and GPS jumps so the line and the mileage stay honest.
 const TRAIL_MAX_ACCURACY = 60;    // m — fixes fuzzier than this still move the dot, but don't draw trail or add distance
