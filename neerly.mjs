@@ -5,6 +5,8 @@
 // optionally with a pin, never a trail) — plus a weather look for the buddy.
 // v0.7a: the Watching map (every live share sent to you, in one place) and email confirmation,
 // which the Watching map needs: shares are matched to accounts by email address.
+// v0.7b: push notifications (Web Push), reactions from watchers, quick starts (presets),
+// and adding friends by @username (their email address stays private).
 //
 // Mounted on the existing nearish-relay HTTP server. Every route lives under
 // /neerly/... and every table is prefixed neerly_ so nothing collides with
@@ -14,8 +16,10 @@
 // When a share stops or expires, its coordinates are wiped from the database.
 // ─────────────────────────────────────────────────────────────────────────────
 import crypto from 'crypto';
+import fs from 'fs';
+import webpush from 'web-push';
 
-const SESSION_MS        = 30 * 24 * 60 * 60 * 1000; // 30 days
+const SESSION_MS       = 30 * 24 * 60 * 60 * 1000; // 30 days
 const RESET_MS          = 15 * 60 * 1000;            // 15 minutes
 const WATCHING_MS       = 40 * 1000;                 // "watching" = pinged recently (recipients poll every 17s)
 const DURATIONS         = [15, 30, 60];              // minutes, for new shares and extensions
@@ -65,6 +69,14 @@ const NOTE_MAX = 60;                             // "Heading to…" / status tex
 // on the share row and is wiped with the location when the share ends.
 const WEATHER_TTL = 15 * 60 * 1000;
 const WEATHER_API = process.env.WEATHER_API || 'https://api.open-meteo.com/v1/forecast';
+// v0.7b — reactions from watchers, push notifications, quick starts
+const REACTIONS          = ['❤️', '👋', '👍', '😂'];
+const REACT_GAP_MS       = 1500;                 // one reaction per viewer every 1.5 s
+const REACT_MAX          = 60;                   // and at most 60 per viewer per share
+const PUSH_REACT_GAP_MS  = 20 * 1000;            // reactions buzz the sender at most every 20 s per share
+const MAX_PUSH_SUBS      = 10;                   // devices per account
+const MAX_PRESETS        = 8;
+const PRESET_NAME_MAX    = 30;
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // NEERLY_URL is where emailed links point: the page itself (…/neerly.html) or, from v0.7a, the
@@ -185,6 +197,45 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       expires_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_recipients_email ON neerly_share_recipients(email);
+    -- v0.7b: one row per device that turned on notifications
+    CREATE TABLE IF NOT EXISTS neerly_push_subs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      endpoint TEXT UNIQUE NOT NULL,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_ok_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_push_email ON neerly_push_subs(email);
+    -- v0.7b: reactions live only while a share runs (the counts stay on the share for the summary)
+    CREATE TABLE IF NOT EXISTS neerly_reactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      share_id INTEGER NOT NULL,
+      emoji TEXT NOT NULL,
+      from_name TEXT,
+      at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_reactions_share ON neerly_reactions(share_id, id);
+    -- v0.7b: quick starts, built by the user. people = the recipients list as the page sends it.
+    CREATE TABLE IF NOT EXISTS neerly_presets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pid TEXT UNIQUE NOT NULL,
+      email TEXT NOT NULL,
+      name TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      minutes INTEGER NOT NULL,
+      note TEXT,
+      show_loc INTEGER NOT NULL DEFAULT 1,
+      people TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_presets_email ON neerly_presets(email);
+    -- v0.7b: small server settings (the push keys)
+    CREATE TABLE IF NOT EXISTS neerly_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
   // v0.4 columns on existing tables (added in place; existing data is kept)
   const addCol = (table, col, def) => {
@@ -209,14 +260,36 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_shares', 'weather', 'TEXT');                        // v0.6: JSON, wiped with the location
   addCol('neerly_shares', 'weather_at', 'INTEGER');
   addCol('neerly_users', 'email_verified_at', 'INTEGER');            // v0.7a: set by a confirmation link or a password reset
+  addCol('neerly_contacts', 'email_known', 'INTEGER NOT NULL DEFAULT 1'); // v0.7b: 0 = added by @username, address stays private
+  addCol('neerly_share_recipients', 'handle', 'TEXT');               // v0.7b: picked by @username: show that, not the address
+  addCol('neerly_shares', 'reactions', 'TEXT');                      // v0.7b: JSON counts, e.g. {"❤️":3}
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
+
+  // ── v0.7b Push keys ─────────────────────────────────────────────────────────
+  // VAPID keys identify this server to the push services. They're made once and kept in the database,
+  // so there's nothing to set up on Render. VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY env vars override them.
+  const metaGet = (k) => db.prepare('SELECT value FROM neerly_meta WHERE key = ?').get(k)?.value;
+  const metaSet = (k, v) => db.prepare('INSERT INTO neerly_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, v);
+  let VAPID = process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY
+    ? { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY } : null;
+  if (!VAPID) {
+    const saved = metaGet('vapid');
+    if (saved) { try { VAPID = JSON.parse(saved); } catch {} }
+    if (!VAPID) { VAPID = webpush.generateVAPIDKeys(); metaSet('vapid', JSON.stringify(VAPID)); console.log('[neerly:push] made new push keys'); }
+  }
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:hello@neerly.net', VAPID.publicKey, VAPID.privateKey);
+  const PUSH_LOG = process.env.NEERLY_PUSH_LOG || ''; // tests: every push is also written here, one JSON line each
 
   // Anonymous viewers (opened the generic link from WhatsApp etc.). In-memory:
   // shareId -> Map(viewerId -> lastPingMs). Losing this on restart is harmless.
   const anonViewers = new Map();
   // shareId -> Set(viewerId) of every link viewer seen during the share (for "times watched").
   const anonSeen = new Map();
+  // v0.7b: shareId -> Map(viewerKey -> { last, n }) so one watcher can't flood the sender with reactions.
+  const reactLimits = new Map();
+  // v0.7b: shareId -> when the sender was last buzzed about a reaction.
+  const reactPushedAt = new Map();
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const now = () => Date.now();
@@ -290,10 +363,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     reset:         db.prepare('SELECT * FROM neerly_reset_tokens WHERE token = ? AND used = 0 AND expires_at > ?'),
     useReset:      db.prepare('UPDATE neerly_reset_tokens SET used = 1 WHERE token = ?'),
 
-    contacts:      db.prepare('SELECT id, email, nickname FROM neerly_contacts WHERE owner_email = ? ORDER BY COALESCE(nickname, email) COLLATE NOCASE'),
-    upsertContact: db.prepare(`INSERT INTO neerly_contacts (owner_email, email, nickname, created_at) VALUES (?, ?, ?, ?)
-                               ON CONFLICT(owner_email, email) DO UPDATE SET nickname = COALESCE(excluded.nickname, nickname)`),
-    contactByEmail:db.prepare('SELECT id, email, nickname FROM neerly_contacts WHERE owner_email = ? AND email = ?'),
+    // v0.7b: a contact added by @username keeps their address private (email_known = 0); its handle is read live,
+    // so a renamed friend shows their new @username.
+    contacts:      db.prepare(`SELECT c.id, c.email, c.nickname, c.email_known, u.username AS uname
+                               FROM neerly_contacts c LEFT JOIN neerly_users u ON u.email = c.email
+                               WHERE c.owner_email = ? ORDER BY COALESCE(c.nickname, CASE WHEN c.email_known THEN c.email ELSE u.username END) COLLATE NOCASE`),
+    upsertContact: db.prepare(`INSERT INTO neerly_contacts (owner_email, email, nickname, created_at, email_known) VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT(owner_email, email) DO UPDATE SET nickname = COALESCE(excluded.nickname, nickname), email_known = MAX(email_known, excluded.email_known)`),
+    contactByEmail:db.prepare(`SELECT c.id, c.email, c.nickname, c.email_known, u.username AS uname
+                               FROM neerly_contacts c LEFT JOIN neerly_users u ON u.email = c.email WHERE c.owner_email = ? AND c.email = ?`),
+    contactById:   db.prepare(`SELECT c.id, c.email, c.nickname, c.email_known, u.username AS uname
+                               FROM neerly_contacts c LEFT JOIN neerly_users u ON u.email = c.email WHERE c.owner_email = ? AND c.id = ?`),
     delContact:    db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ? AND id = ?'),
 
     insertShare:   db.prepare('INSERT INTO neerly_shares (token, sender_email, sender_name, started_at, expires_at, lat, lng, accuracy, loc_at, mode, note, show_loc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
@@ -327,7 +407,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     setLocation:   db.prepare('UPDATE neerly_shares SET lat = ?, lng = ?, accuracy = ?, loc_at = ? WHERE id = ?'),
     extendShare:   db.prepare('UPDATE neerly_shares SET expires_at = ? WHERE id = ?'),
 
-    insertRecipient: db.prepare('INSERT OR IGNORE INTO neerly_share_recipients (share_id, email, nickname, view_token, hidden) VALUES (?, ?, ?, ?, ?)'),
+    insertRecipient: db.prepare('INSERT OR IGNORE INTO neerly_share_recipients (share_id, email, nickname, view_token, hidden, handle) VALUES (?, ?, ?, ?, ?, ?)'),
     recipients:    db.prepare('SELECT * FROM neerly_share_recipients WHERE share_id = ? ORDER BY id'),
     recipientByView: db.prepare('SELECT * FROM neerly_share_recipients WHERE share_id = ? AND view_token = ?'),
     markEmailed:   db.prepare('UPDATE neerly_share_recipients SET emailed = 1 WHERE id = ?'),
@@ -337,7 +417,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     insertRequest: db.prepare('INSERT INTO neerly_update_requests (share_id, requester_email, requester_name, created_at) VALUES (?, ?, ?, ?)'),
 
     // v0.7a — Watching: live shares sent to this address (one per sender: a sender has one live share at a time)
-    watchingFor:   db.prepare(`SELECT s.*, r.id AS rid, r.view_token AS r_view, r.opened_at AS r_opened
+    watchingFor:   db.prepare(`SELECT s.*, r.id AS rid, r.view_token AS r_view, r.opened_at AS r_opened, r.email AS r_email, r.nickname AS r_nick, r.handle AS r_handle, r.hidden AS r_hidden
                                FROM neerly_share_recipients r JOIN neerly_shares s ON s.id = r.share_id
                                WHERE r.email = ? AND s.ended_at IS NULL AND s.expires_at > ? AND s.sender_email != ?
                                ORDER BY s.started_at DESC`),
@@ -347,6 +427,24 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     verifyToken:   db.prepare('SELECT * FROM neerly_verify_tokens WHERE token = ? AND expires_at > ?'),
     delVerifyFor:  db.prepare('DELETE FROM neerly_verify_tokens WHERE email = ?'),
     purgeVerify:   db.prepare('DELETE FROM neerly_verify_tokens WHERE expires_at < ?'),
+
+    // v0.7b — push, reactions, quick starts
+    pushSubsFor:   db.prepare('SELECT * FROM neerly_push_subs WHERE email = ? ORDER BY id'),
+    upsertPushSub: db.prepare(`INSERT INTO neerly_push_subs (email, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, p256dh = excluded.p256dh, auth = excluded.auth, created_at = excluded.created_at`),
+    delPushSub:    db.prepare('DELETE FROM neerly_push_subs WHERE endpoint = ?'),
+    delPushSubMine:db.prepare('DELETE FROM neerly_push_subs WHERE endpoint = ? AND email = ?'),
+    pushOk:        db.prepare('UPDATE neerly_push_subs SET last_ok_at = ? WHERE endpoint = ?'),
+    insertReaction:db.prepare('INSERT INTO neerly_reactions (share_id, emoji, from_name, at) VALUES (?, ?, ?, ?)'),
+    reactionsSince:db.prepare('SELECT id, emoji, from_name, at FROM neerly_reactions WHERE share_id = ? AND id > ? ORDER BY id DESC LIMIT 20'),
+    lastReactionId:db.prepare('SELECT MAX(id) n FROM neerly_reactions WHERE share_id = ?'),
+    delReactions:  db.prepare('DELETE FROM neerly_reactions WHERE share_id = ?'),
+    setReactions:  db.prepare('UPDATE neerly_shares SET reactions = ? WHERE id = ?'),
+    presets:       db.prepare('SELECT * FROM neerly_presets WHERE email = ? ORDER BY id'),
+    presetByPid:   db.prepare('SELECT * FROM neerly_presets WHERE pid = ? AND email = ?'),
+    insertPreset:  db.prepare('INSERT INTO neerly_presets (pid, email, name, mode, minutes, note, show_loc, people, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    updatePreset:  db.prepare('UPDATE neerly_presets SET name = ?, mode = ?, minutes = ?, note = ?, show_loc = ?, people = ? WHERE pid = ? AND email = ?'),
+    delPreset:     db.prepare('DELETE FROM neerly_presets WHERE pid = ? AND email = ?'),
 
     purgeSessions: db.prepare('DELETE FROM neerly_sessions WHERE expires_at < ?'),
     purgeResets:   db.prepare('DELETE FROM neerly_reset_tokens WHERE expires_at < ? OR used = 1'),
@@ -359,8 +457,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       db.prepare('DELETE FROM neerly_share_points WHERE share_id = ?').run(id);
       db.prepare('DELETE FROM neerly_share_recipients WHERE share_id = ?').run(id);
       db.prepare('DELETE FROM neerly_update_requests WHERE share_id = ?').run(id);
-      anonViewers.delete(id); anonSeen.delete(id);
+      q.delReactions.run(id);
+      anonViewers.delete(id); anonSeen.delete(id); reactLimits.delete(id);
     }
+    db.prepare('DELETE FROM neerly_push_subs WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_presets WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_shares WHERE sender_email = ?').run(email);
     db.prepare('DELETE FROM neerly_update_requests WHERE requester_email = ?').run(email);
     db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ?').run(email);
@@ -491,6 +592,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const changed = q.endShare.run(endedAt, share.id).changes;
       q.wipeShareLoc.run(share.id);
       q.delPoints.run(share.id);
+      q.delReactions.run(share.id); // v0.7b: who reacted goes; the counts stay for the summary card
       if (changed) {
         const fresh = q.shareById.get(share.id);
         q.ensureStats.run(fresh.sender_email);
@@ -500,6 +602,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     checkBadges(share.sender_email);
     anonViewers.delete(share.id);
     anonSeen.delete(share.id);
+    reactLimits.delete(share.id);
+    reactPushedAt.delete(share.id);
   }
 
   // ── Trail ───────────────────────────────────────────────────────────────────
@@ -532,10 +636,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return {
       minutes: Math.max(0, Math.round(((share.ended_at || now()) - share.started_at) / 60000)),
       distanceM: Math.round(share.distance_m || 0),
-      watchedBy: rs.filter(r => r.opened_at).map(r => r.nickname || r.email.split('@')[0]),
+      watchedBy: rs.filter(r => r.opened_at).map(recipLabel),
       linkViewers: share.link_views || 0,
+      reactions: reactionCounts(share),
     };
   }
+  function reactionCounts(share) { try { const o = JSON.parse(share.reactions || '{}'); return o && typeof o === 'object' ? o : {}; } catch { return {}; } }
 
   // ── v0.6 Weather ────────────────────────────────────────────────────────────
   // WMO weather codes → a few conditions the buddy can dress for.
@@ -687,6 +793,59 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return sendEmail(email, 'Confirm your email for Neerly', html, link);
   }
 
+  // ── v0.7b Push notifications ────────────────────────────────────────────────
+  // Sends to every device this account turned notifications on for. Devices the push service says are
+  // gone (404/410) are forgotten. Never throws, never blocks a response. Returns how many devices it reached.
+  async function pushTo(email, msg) {
+    const subs = q.pushSubsFor.all(email);
+    if (PUSH_LOG) { try { fs.appendFileSync(PUSH_LOG, JSON.stringify({ to: email, devices: subs.length, ...msg }) + '\n'); } catch {} }
+    if (!subs.length) return 0;
+    const payload = JSON.stringify({ title: msg.title, body: msg.body || '', url: msg.url || PAGE_URL, tag: msg.tag || undefined });
+    let ok = 0;
+    await Promise.all(subs.map(async (s) => {
+      try {
+        await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload, { TTL: msg.ttl ?? 3600, urgency: 'high' });
+        q.pushOk.run(now(), s.endpoint); ok++;
+      } catch (e) {
+        if (e.statusCode === 404 || e.statusCode === 410) { q.delPushSub.run(s.endpoint); console.log(`[neerly:push] forgot a device of ${email} (${e.statusCode})`); }
+        else console.warn(`[neerly:push] send to ${email} failed:`, e.statusCode || '', e.body || e.message);
+      }
+    }));
+    if (ok) console.log(`[neerly:push] → ${email} | ${msg.title} (${ok} device${ok === 1 ? '' : 's'})`);
+    return ok;
+  }
+  const hasPush = (email) => q.pushSubsFor.all(email).length > 0;
+  // The live link a recipient gets, for notifications that open a share.
+  const viewLink = (share, r) => `${shareBase(share)}?share=${share.token}${r ? `&r=${r.view_token}` : ''}`;
+  // What the sender sees as a watcher's name: their own nickname for them, or the @username they picked.
+  const recipLabel = (r) => r.nickname || (r.handle ? '@' + r.handle : r.hidden ? 'Someone' : r.email.split('@')[0]);
+  // One line about the sender's own share, for the notifications they get about it.
+  const yourShare = (share) => share.mode === 'now'
+    ? (share.note ? `Your status: ${share.note}` : 'Your spot right now')
+    : (share.note ? `Your share: on the way to ${share.note}` : 'Your share: on the way');
+  function pushWatching(share, who) {
+    pushTo(share.sender_email, { title: `👀 ${who} ${who === 'Someone' ? 'opened your link' : 'is watching'}`, body: yourShare(share), tag: `watch-${share.token}` });
+  }
+  // Tells a recipient with a Neerly account that someone is sharing with them. Their address must be
+  // confirmed (as for the Watching map) unless the sender picked them by @username, which names the account,
+  // or it's a share back, which goes to the account that made the original share.
+  function pushShareTo(share, r, isShareBack) {
+    const u = q.userByEmail.get(r.email);
+    if (!u || (!u.email_verified_at && !r.handle && !r.hidden)) return Promise.resolve(0);
+    const icon = isShareBack ? '🔁' : share.mode === 'now' ? '📍' : '👣';
+    return pushTo(r.email, { title: `${icon} ${shareTitle(share, isShareBack)}`, body: share.mode === 'now' ? 'Tap to see it live' : 'Tap to watch live', url: viewLink(share, r), tag: `share-${share.token}` });
+  }
+  // v0.7b: contacts as the page sees them. Someone added by @username has no address here, only the handle.
+  function contactOut(c) {
+    if (!c) return null;
+    return { id: c.id, email: c.email_known ? c.email : null, username: c.email_known ? null : (c.uname || null), nickname: c.nickname || null };
+  }
+  const contactsFor = (email) => q.contacts.all(email).map(contactOut);
+  function presetOut(r) {
+    let people = []; try { people = JSON.parse(r.people || '[]'); } catch {}
+    return { pid: r.pid, name: r.name, mode: r.mode, minutes: r.minutes, note: r.note || '', showLocation: !!r.show_loc, people, link: `${PAGE_URL}?preset=${r.pid}` };
+  }
+
   // ── Share views ───────────────────────────────────────────────────────────
   function isActive(share) { return !share.ended_at && share.expires_at > now(); }
 
@@ -706,8 +865,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return 'sent';
   }
 
-  function senderView(share, trailFrom = 0) {
+  // rxFrom (v0.7b): send reactions newer than this id, so the sender's screen can pop them above the buddy.
+  function senderView(share, trailFrom = 0, rxFrom = null) {
     const t = now();
+    const rxAfter = rxFrom == null || rxFrom === '' ? null : Number(rxFrom);
+    const live = isActive(share);
     const anon = anonViewers.get(share.id);
     let anonWatching = 0;
     if (anon) for (const [, ts] of anon) if (t - ts < WATCHING_MS) anonWatching++;
@@ -725,13 +887,18 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       weather: weatherOf(share),
       location: share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
       recipients: q.recipients.all(share.id).map(r => ({
-        email: r.hidden ? maskEmail(r.email) : r.email, nickname: r.nickname, hidden: !!r.hidden, status: recipientStatus(r), emailed: !!r.emailed,
+        // v0.7b: someone picked by @username shows as that; their address stays private.
+        email: r.hidden || r.handle ? (r.handle ? '@' + r.handle : maskEmail(r.email)) : r.email,
+        nickname: r.nickname || (r.handle ? '@' + r.handle : null), hidden: !!r.hidden || !!r.handle, status: recipientStatus(r), emailed: !!r.emailed,
         openedAt: r.opened_at, lastPingAt: r.last_ping_at,
       })),
       linkViewersWatching: anonWatching,
       distanceM: Math.round(share.distance_m || 0),
-      ...(isActive(share) ? trailSlice(share.id, trailFrom) : { trail: [], trailFrom: 0, trailCount: 0 }),
-      summary: isActive(share) ? null : shareSummary(share),
+      reactionCounts: reactionCounts(share),
+      reactionsLastId: live ? (q.lastReactionId.get(share.id).n || 0) : 0,
+      reactions: live && Number.isFinite(rxAfter) ? q.reactionsSince.all(share.id, rxAfter).reverse().map(x => ({ id: x.id, emoji: x.emoji, name: x.from_name || 'Someone', at: x.at })) : [],
+      ...(live ? trailSlice(share.id, trailFrom) : { trail: [], trailFrom: 0, trailCount: 0 }),
+      summary: live ? null : shareSummary(share),
     };
   }
   function durationsFor(mode) { return mode === 'now' ? NOW_DURATIONS : DURATIONS; }
@@ -863,7 +1030,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const friends = [];
       for (const share of bySender.values()) {
         if (look) {
-          if (!share.r_opened) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email); }
+          if (!share.r_opened) {
+            q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email);
+            pushWatching(share, recipLabel({ email: share.r_email, nickname: share.r_nick, handle: share.r_handle, hidden: share.r_hidden }));
+          }
           q.pingRecipient.run(t, t, share.rid);
           refreshWeather(share);
         }
@@ -971,27 +1141,114 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       return json(res, 200, { ok: true });
     }
 
+    // ---- v0.7b: push notifications ----
+    // The public key the browser needs to subscribe. No sign-in needed (it's public).
+    if (p === '/neerly/push/key' && M === 'GET') {
+      return json(res, 200, { key: VAPID.publicKey });
+    }
+    // Turn notifications on for this device. A device belongs to one account at a time.
+    if (p === '/neerly/me/push' && M === 'POST') {
+      const u = requireUser(req);
+      const { subscription } = await readBody(req);
+      const ep = String(subscription?.endpoint || ''), k = subscription?.keys || {};
+      let host = '';
+      try { const pu = new URL(ep); host = pu.protocol === 'https:' ? pu.hostname : ''; } catch {}
+      if (!host || ep.length > 1000 || typeof k.p256dh !== 'string' || typeof k.auth !== 'string' || k.p256dh.length > 200 || k.auth.length > 100) {
+        throw new HttpError(400, 'That notification setup didn’t work. Try again.');
+      }
+      q.upsertPushSub.run(u.email, ep, k.p256dh, k.auth, now());
+      const subs = q.pushSubsFor.all(u.email);
+      for (const s of subs.slice(0, Math.max(0, subs.length - MAX_PUSH_SUBS))) q.delPushSub.run(s.endpoint); // oldest devices go first
+      console.log(`[neerly:push] ${u.email} turned notifications on (${Math.min(subs.length, MAX_PUSH_SUBS)} device(s))`);
+      return json(res, 200, { ok: true, devices: Math.min(subs.length, MAX_PUSH_SUBS) });
+    }
+    if (p === '/neerly/me/push/delete' && M === 'POST') {
+      const u = requireUser(req);
+      const { endpoint } = await readBody(req);
+      q.delPushSubMine.run(String(endpoint || ''), u.email);
+      return json(res, 200, { ok: true });
+    }
+    // A test notification, so people can see it works (from the Profile screen).
+    if (p === '/neerly/me/push/test' && M === 'POST') {
+      const u = requireUser(req);
+      const n = await pushTo(u.email, { title: '🦊 Notifications are on', body: 'You’ll hear from Neerly when someone watches, reacts or shares with you.', tag: 'test', ttl: 300 });
+      return json(res, 200, { ok: true, devices: n });
+    }
+
+    // ---- v0.7b: quick starts (presets) ----
+    // Each one is a share the user set up: name, mode, duration, optional destination or status, people.
+    // Its link (?preset=…) opens Neerly ready to go, for an iPhone Shortcut or a home-screen bookmark.
+    if (p === '/neerly/presets' && M === 'GET') {
+      const u = requireUser(req);
+      return json(res, 200, { presets: q.presets.all(u.email).map(presetOut) });
+    }
+    if (p === '/neerly/presets' && M === 'POST') {
+      const u = requireUser(req);
+      const body = await readBody(req);
+      const name = clean(body.name, PRESET_NAME_MAX);
+      if (!name) throw new HttpError(400, 'Give it a name, like “Gym” or “Home from work”');
+      const mode = String(body.mode || 'way');
+      if (!MODES.includes(mode)) throw new HttpError(400, 'Unknown share mode');
+      const minutes = Number(body.minutes);
+      if (!durationsFor(mode).includes(minutes)) throw new HttpError(400, durationError(mode));
+      const note = cleanNote(body.note) || null;
+      const showLoc = mode === 'way' ? 1 : body.showLocation === false ? 0 : 1;
+      if (mode === 'now' && !showLoc && !note) throw new HttpError(400, 'Add what you’re up to, or show where you are');
+      // People are kept as the page sends them: { email } or { contact: id } (friends added by @username).
+      const people = [];
+      for (const r of Array.isArray(body.people) ? body.people.slice(0, MAX_RECIPIENTS) : []) {
+        if (r?.contact != null && q.contactById.get(u.email, Number(r.contact))) people.push({ contact: Number(r.contact) });
+        else if (isEmail(norm(r?.email)) && norm(r.email) !== u.email) people.push({ email: norm(r.email) });
+      }
+      if (body.pid) {
+        const cur = q.presetByPid.get(String(body.pid), u.email);
+        if (!cur) throw new HttpError(404, 'That quick start is gone');
+        q.updatePreset.run(name, mode, minutes, note, showLoc, JSON.stringify(people), cur.pid, u.email);
+        return json(res, 200, { preset: presetOut(q.presetByPid.get(cur.pid, u.email)), presets: q.presets.all(u.email).map(presetOut) });
+      }
+      if (q.presets.all(u.email).length >= MAX_PRESETS) throw new HttpError(400, `You can keep up to ${MAX_PRESETS} quick starts. Remove one first.`);
+      const pid = randToken(9);
+      q.insertPreset.run(pid, u.email, name, mode, minutes, note, showLoc, JSON.stringify(people), now());
+      return json(res, 200, { preset: presetOut(q.presetByPid.get(pid, u.email)), presets: q.presets.all(u.email).map(presetOut) });
+    }
+    if (p === '/neerly/presets/delete' && M === 'POST') {
+      const u = requireUser(req);
+      const { pid } = await readBody(req);
+      q.delPreset.run(String(pid || ''), u.email);
+      return json(res, 200, { presets: q.presets.all(u.email).map(presetOut) });
+    }
+
     // ---- Contacts ----
     if (p === '/neerly/contacts' && M === 'GET') {
       const u = requireUser(req);
-      return json(res, 200, { contacts: q.contacts.all(u.email) });
+      return json(res, 200, { contacts: contactsFor(u.email) });
     }
 
+    // Add someone by email, or (v0.7b) by @username. A friend added by username keeps their address private.
     if (p === '/neerly/contacts' && M === 'POST') {
       const u = requireUser(req);
-      const { email, nickname } = await readBody(req);
+      const { email, username, nickname } = await readBody(req);
+      const nick = clean(nickname, 40) || null;
+      if (username != null && String(username).trim() !== '') {
+        const un = normUsername(username);
+        const friend = un ? q.userByEmail.get(q.userByUsername.get(un)?.email || '') : null;
+        if (!friend) throw new HttpError(404, `No one on Neerly is @${un || '…'}. Check the spelling, or add their email instead.`);
+        if (friend.email === u.email) throw new HttpError(400, 'That’s you');
+        q.upsertContact.run(u.email, friend.email, nick, now(), 0);
+        return json(res, 200, { contact: contactOut(q.contactByEmail.get(u.email, friend.email)), contacts: contactsFor(u.email) });
+      }
       const e = norm(email);
       if (!isEmail(e)) throw new HttpError(400, 'That email doesn’t look right');
       if (e === u.email) throw new HttpError(400, 'That’s your own email');
-      q.upsertContact.run(u.email, e, clean(nickname, 40) || null, now());
-      return json(res, 200, { contact: q.contactByEmail.get(u.email, e), contacts: q.contacts.all(u.email) });
+      q.upsertContact.run(u.email, e, nick, now(), 1);
+      return json(res, 200, { contact: contactOut(q.contactByEmail.get(u.email, e)), contacts: contactsFor(u.email) });
     }
 
     if (p === '/neerly/contacts/delete' && M === 'POST') {
       const u = requireUser(req);
       const { id } = await readBody(req);
       q.delContact.run(u.email, Number(id));
-      return json(res, 200, { contacts: q.contacts.all(u.email) });
+      return json(res, 200, { contacts: contactsFor(u.email) });
     }
 
     // ---- Create share ----
@@ -1010,10 +1267,18 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const seen = new Set();
       const rs = [];
       for (const r of list) {
+        // v0.7b: { contact: id } is a saved friend (added by @username, so the page never had their address).
+        if (r?.contact != null) {
+          const c = q.contactById.get(u.email, Number(r.contact));
+          if (!c || c.email === u.email || seen.has(c.email)) continue;
+          seen.add(c.email);
+          rs.push({ email: c.email, nickname: c.nickname || null, hidden: 0, handle: c.email_known ? null : (c.uname || null), known: !!c.email_known });
+          continue;
+        }
         const e = norm(r?.email);
         if (!isEmail(e) || e === u.email || seen.has(e)) continue;
         seen.add(e);
-        rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0 });
+        rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0, handle: null, known: true });
       }
       // v0.5 one-tap share back: the server looks up the original sender, so their
       // address is never shown to whoever holds the link. It isn't saved as a contact either.
@@ -1030,7 +1295,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const e = original.sender_email;
         const i = rs.findIndex(r => r.email === e);
         if (i >= 0) rs.splice(i, 1);
-        rs.unshift({ email: e, nickname: original.sender_name, hidden: 1 });
+        rs.unshift({ email: e, nickname: original.sender_name, hidden: 1, handle: null, known: false });
       }
       if (rs.length > MAX_RECIPIENTS) throw new HttpError(400, `Up to ${MAX_RECIPIENTS} people per share`);
       // Recipients are optional: a link-only share (pasted into WhatsApp) is fine.
@@ -1046,8 +1311,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (mode === 'way') addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
         countShareStart(u.email, t, Number(tzOffset));
         for (const r of rs) {
-          q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12), r.hidden);
-          if (!r.hidden) q.upsertContact.run(u.email, r.email, r.nickname, t); // remember for next time
+          q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12), r.hidden, r.handle);
+          if (!r.hidden) q.upsertContact.run(u.email, r.email, r.nickname, t, r.known ? 1 : 0); // remember for next time
         }
         if (original) {
           q.insertShareBack.run(original.id, u.email, info.lastInsertRowid, t);
@@ -1059,8 +1324,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       refreshWeather(created);
 
       // Email in the background so the sender's screen isn't waiting on Resend.
+      // v0.7b: people with Neerly also get a notification. Someone picked by @username gets the
+      // notification instead of an email when they have notifications on (otherwise the email).
       for (const r of q.recipients.all(created.id)) {
-        shareEmail(created, r, !!r.hidden && !!original).then(ok => { if (ok) q.markEmailed.run(r.id); });
+        const back = !!r.hidden && !!original;
+        const pushed = pushShareTo(created, r, back);
+        if (r.handle) pushed.then(n => n ? q.markEmailed.run(r.id) : shareEmail(created, r, back).then(ok => { if (ok) q.markEmailed.run(r.id); }));
+        else shareEmail(created, r, back).then(ok => { if (ok) q.markEmailed.run(r.id); });
       }
       console.log(`[neerly:share] ${u.email} started ${minutes}m ${mode}${showLoc ? '' : ' (no location)'} share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
       return json(res, 200, { share: senderView(created), newBadges, shareBackTo: original ? original.sender_name : null });
@@ -1083,7 +1353,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (r) {
           recipient = q.recipientByView.get(share.id, r);
           if (recipient && active) {
-            if (!recipient.opened_at) { q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email); }
+            if (!recipient.opened_at) {
+              q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email);
+              pushWatching(share, recipLabel(recipient)); // v0.7b: "👀 Mom is watching", even with the phone locked
+            }
             q.pingRecipient.run(now(), now(), recipient.id);
           }
         } else if (viewer && active && /^[A-Za-z0-9_-]{6,40}$/.test(viewer)) {
@@ -1092,6 +1365,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           if (!anonSeen.has(share.id)) anonSeen.set(share.id, new Set());
           const seen = anonSeen.get(share.id);
           if (!seen.has(viewer) && seen.size < 500) {
+            if (!seen.size) pushWatching(share, 'Someone'); // the first link viewer only, so a group chat doesn't buzz 20 times
             seen.add(viewer);
             q.incLinkViews.run(share.id);
             q.ensureStats.run(share.sender_email); q.statsWatched.run(share.sender_email); checkBadges(share.sender_email);
@@ -1110,6 +1384,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
             senderOutfit: lookFor(sender).outfit,
             senderTrail: lookFor(sender).trail,
             canShareBack: now() - Math.min(share.ended_at || share.expires_at, now()) <= SHARE_BACK_WINDOW,
+            reactions: REACTIONS, // v0.7b
             active,
             startedAt: share.started_at,
             expiresAt: share.expires_at,
@@ -1128,16 +1403,16 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
         refreshWeather(share);
-        return json(res, 200, { share: senderView(share, url.searchParams.get('t')) });
+        return json(res, 200, { share: senderView(share, url.searchParams.get('t'), url.searchParams.get('rx')) });
       }
 
       if (action === 'location' && M === 'POST') {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
         if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
-        const { lat, lng, accuracy, trailFrom } = await readBody(req);
+        const { lat, lng, accuracy, trailFrom, rxFrom } = await readBody(req);
         // Right now with the location hidden: nothing is stored, whatever the page sends.
-        if (!share.show_loc) return json(res, 200, { share: senderView(share, trailFrom) });
+        if (!share.show_loc) return json(res, 200, { share: senderView(share, trailFrom, rxFrom) });
         if (!validCoord(lat, lng)) throw new HttpError(400, 'Invalid location');
         const t = now();
         db.transaction(() => {
@@ -1146,7 +1421,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         })();
         const fresh = q.shareByToken.get(token);
         refreshWeather(fresh);
-        return json(res, 200, { share: senderView(fresh, trailFrom) });
+        return json(res, 200, { share: senderView(fresh, trailFrom, rxFrom) });
       }
 
       // v0.6: change the "Heading to…" / status text while the share runs.
@@ -1181,6 +1456,37 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         return json(res, 200, { share: senderView(q.shareByToken.get(token)) });
       }
 
+      // v0.7b: a reaction from someone watching (❤️ 👋 👍 😂). It pops above the buddy on the sender's
+      // screen and buzzes their phone (at most every 20 s). Only the counts outlive the share.
+      if (action === 'react' && M === 'POST') {
+        let share = q.shareByToken.get(token);
+        if (!share) throw new HttpError(404, 'This link doesn’t match a share');
+        share = endIfExpired(share);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended' });
+        const { emoji, r, v } = await readBody(req);
+        if (!REACTIONS.includes(emoji)) throw new HttpError(400, 'Pick one of the reactions');
+        const me = authUser(req);
+        if (me && me.email === share.sender_email) throw new HttpError(400, 'That’s your own share');
+        const recipient = r ? q.recipientByView.get(share.id, String(r)) : null;
+        const viewer = !recipient && v && /^[A-Za-z0-9_-]{6,40}$/.test(String(v)) ? String(v) : null;
+        if (!recipient && !me && !viewer) throw new HttpError(400, 'Open the share link first');
+        const key = recipient ? 'r:' + recipient.id : me ? 'u:' + me.email : 'v:' + viewer;
+        if (!reactLimits.has(share.id)) reactLimits.set(share.id, new Map());
+        const lim = reactLimits.get(share.id).get(key) || { last: 0, n: 0 };
+        const t = now();
+        if (t - lim.last < REACT_GAP_MS || lim.n >= REACT_MAX) return json(res, 429, { error: 'Easy there! Give it a second.' });
+        reactLimits.get(share.id).set(key, { last: t, n: lim.n + 1 });
+        const name = recipient ? recipLabel(recipient) : me ? me.name : 'Someone';
+        const counts = reactionCounts(share);
+        counts[emoji] = (counts[emoji] || 0) + 1;
+        db.transaction(() => { q.insertReaction.run(share.id, emoji, name, t); q.setReactions.run(JSON.stringify(counts), share.id); })();
+        if (t - (reactPushedAt.get(share.id) || 0) >= PUSH_REACT_GAP_MS) {
+          reactPushedAt.set(share.id, t);
+          pushTo(share.sender_email, { title: `${emoji} ${name === 'Someone' ? 'Someone reacted' : name}`, body: `${name === 'Someone' ? 'Someone' : 'They'} reacted to your share`, tag: `react-${share.token}`, ttl: 600 });
+        }
+        return json(res, 200, { ok: true });
+      }
+
       if (action === 'request-update' && M === 'POST') {
         let share = q.shareByToken.get(token);
         if (!share) throw new HttpError(404, 'This link doesn’t match a share');
@@ -1202,6 +1508,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           return json(res, 200, { ok: true, alreadyAsked: true, signedIn: !!signedIn });
         }
         q.insertRequest.run(share.id, email, name, now());
+        pushTo(share.sender_email, { title: `🙋 ${name} wants to know where you are`, body: 'Open Neerly if you’d like to share again. It’s up to you.', tag: `request-${share.token}` });
         await requestEmail(share, name);
         console.log(`[neerly:request] ${email} asked ${share.sender_email} for an update`);
         return json(res, 200, { ok: true, signedIn: !!signedIn });
@@ -1241,6 +1548,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     q.purgeSessions.run(t);
     q.purgeResets.run(t);
     q.purgeVerify.run(t);
+    for (const [shareId] of reactLimits) if (!q.shareById.get(shareId) || q.shareById.get(shareId).ended_at) reactLimits.delete(shareId);
     for (const [shareId, viewers] of anonViewers) {
       for (const [v, ts] of viewers) if (t - ts > WATCHING_MS * 3) viewers.delete(v);
       if (!viewers.size) anonViewers.delete(shareId);

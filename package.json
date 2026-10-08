@@ -9,9 +9,10 @@
     "build": "npm install"
   },
   "dependencies": {
-    "ws": "^8.18.0",
     "better-sqlite3": "^11.1.2",
-    "resend": "^3.5.0"
+    "resend": "^3.5.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": "20"
