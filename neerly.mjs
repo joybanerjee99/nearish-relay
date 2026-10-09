@@ -263,6 +263,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_contacts', 'email_known', 'INTEGER NOT NULL DEFAULT 1'); // v0.7b: 0 = added by @username, address stays private
   addCol('neerly_share_recipients', 'handle', 'TEXT');               // v0.7b: picked by @username: show that, not the address
   addCol('neerly_shares', 'reactions', 'TEXT');                      // v0.7b: JSON counts, e.g. {"❤️":3}
+  addCol('neerly_reactions', 'recipient_id', 'INTEGER');            // v0.7b.1: which invited watcher reacted (null: a link viewer)
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -435,7 +436,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     delPushSub:    db.prepare('DELETE FROM neerly_push_subs WHERE endpoint = ?'),
     delPushSubMine:db.prepare('DELETE FROM neerly_push_subs WHERE endpoint = ? AND email = ?'),
     pushOk:        db.prepare('UPDATE neerly_push_subs SET last_ok_at = ? WHERE endpoint = ?'),
-    insertReaction:db.prepare('INSERT INTO neerly_reactions (share_id, emoji, from_name, at) VALUES (?, ?, ?, ?)'),
+    insertReaction:db.prepare('INSERT INTO neerly_reactions (share_id, emoji, from_name, at, recipient_id) VALUES (?, ?, ?, ?, ?)'),
+    reactionsByWho:db.prepare('SELECT recipient_id, from_name, emoji, COUNT(*) n FROM neerly_reactions WHERE share_id = ? GROUP BY recipient_id, from_name, emoji'),
     reactionsSince:db.prepare('SELECT id, emoji, from_name, at FROM neerly_reactions WHERE share_id = ? AND id > ? ORDER BY id DESC LIMIT 20'),
     lastReactionId:db.prepare('SELECT MAX(id) n FROM neerly_reactions WHERE share_id = ?'),
     delReactions:  db.prepare('DELETE FROM neerly_reactions WHERE share_id = ?'),
@@ -841,6 +843,31 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return { id: c.id, email: c.email_known ? c.email : null, username: c.email_known ? null : (c.uname || null), nickname: c.nickname || null };
   }
   const contactsFor = (email) => q.contacts.all(email).map(contactOut);
+  // The people a share goes to, as the page sends them: { email, nickname } or (v0.7b) { contact: id }, a saved
+  // friend added by @username, so the page never had their address. Skips yourself, duplicates and bad entries.
+  function collectRecipients(u, list, seen = new Set()) {
+    const rs = [];
+    for (const r of Array.isArray(list) ? list : []) {
+      if (r?.contact != null) {
+        const c = q.contactById.get(u.email, Number(r.contact));
+        if (!c || c.email === u.email || seen.has(c.email)) continue;
+        seen.add(c.email);
+        rs.push({ email: c.email, nickname: c.nickname || null, hidden: 0, handle: c.email_known ? null : (c.uname || null), known: !!c.email_known });
+        continue;
+      }
+      const e = norm(r?.email);
+      if (!isEmail(e) || e === u.email || seen.has(e)) continue;
+      seen.add(e);
+      rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0, handle: null, known: true });
+    }
+    return rs;
+  }
+  // Emails (or, for someone picked by @username with notifications on, notifies) one recipient of a live share.
+  function deliverShare(share, r, isShareBack) {
+    const pushed = pushShareTo(share, r, isShareBack);
+    if (r.handle) pushed.then(n => n ? q.markEmailed.run(r.id) : shareEmail(share, r, isShareBack).then(ok => { if (ok) q.markEmailed.run(r.id); }));
+    else shareEmail(share, r, isShareBack).then(ok => { if (ok) q.markEmailed.run(r.id); });
+  }
   function presetOut(r) {
     let people = []; try { people = JSON.parse(r.people || '[]'); } catch {}
     return { pid: r.pid, name: r.name, mode: r.mode, minutes: r.minutes, note: r.note || '', showLocation: !!r.show_loc, people, link: `${PAGE_URL}?preset=${r.pid}` };
@@ -870,6 +897,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     const t = now();
     const rxAfter = rxFrom == null || rxFrom === '' ? null : Number(rxFrom);
     const live = isActive(share);
+    // v0.7b.1: reactions per person while the share runs, so the sender can see who sent what.
+    // Invited watchers are matched by their row; link viewers and others are listed by name ("Someone").
+    const byRecipient = new Map(), byOther = new Map();
+    if (live) for (const x of q.reactionsByWho.all(share.id)) {
+      const m = x.recipient_id != null ? byRecipient : byOther, k = x.recipient_id ?? (x.from_name || 'Someone');
+      if (!m.has(k)) m.set(k, {});
+      m.get(k)[x.emoji] = (m.get(k)[x.emoji] || 0) + x.n;
+    }
     const anon = anonViewers.get(share.id);
     let anonWatching = 0;
     if (anon) for (const [, ts] of anon) if (t - ts < WATCHING_MS) anonWatching++;
@@ -891,7 +926,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         email: r.hidden || r.handle ? (r.handle ? '@' + r.handle : maskEmail(r.email)) : r.email,
         nickname: r.nickname || (r.handle ? '@' + r.handle : null), hidden: !!r.hidden || !!r.handle, status: recipientStatus(r), emailed: !!r.emailed,
         openedAt: r.opened_at, lastPingAt: r.last_ping_at,
+        reactions: byRecipient.get(r.id) || {},
       })),
+      otherReactions: [...byOther].map(([name, counts]) => ({ name, counts })),
       linkViewersWatching: anonWatching,
       distanceM: Math.round(share.distance_m || 0),
       reactionCounts: reactionCounts(share),
@@ -1263,23 +1300,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       if (!durationsFor(mode).includes(Number(minutes))) throw new HttpError(400, durationError(mode));
       if (showLoc && !validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
       if (mode === 'now' && !showLoc && !note) throw new HttpError(400, 'Add what you’re up to, or show where you are');
-      const list = Array.isArray(recipients) ? recipients : [];
-      const seen = new Set();
-      const rs = [];
-      for (const r of list) {
-        // v0.7b: { contact: id } is a saved friend (added by @username, so the page never had their address).
-        if (r?.contact != null) {
-          const c = q.contactById.get(u.email, Number(r.contact));
-          if (!c || c.email === u.email || seen.has(c.email)) continue;
-          seen.add(c.email);
-          rs.push({ email: c.email, nickname: c.nickname || null, hidden: 0, handle: c.email_known ? null : (c.uname || null), known: !!c.email_known });
-          continue;
-        }
-        const e = norm(r?.email);
-        if (!isEmail(e) || e === u.email || seen.has(e)) continue;
-        seen.add(e);
-        rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0, handle: null, known: true });
-      }
+      const rs = collectRecipients(u, recipients);
       // v0.5 one-tap share back: the server looks up the original sender, so their
       // address is never shown to whoever holds the link. It isn't saved as a contact either.
       let original = null, countBack = false;
@@ -1326,12 +1347,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       // Email in the background so the sender's screen isn't waiting on Resend.
       // v0.7b: people with Neerly also get a notification. Someone picked by @username gets the
       // notification instead of an email when they have notifications on (otherwise the email).
-      for (const r of q.recipients.all(created.id)) {
-        const back = !!r.hidden && !!original;
-        const pushed = pushShareTo(created, r, back);
-        if (r.handle) pushed.then(n => n ? q.markEmailed.run(r.id) : shareEmail(created, r, back).then(ok => { if (ok) q.markEmailed.run(r.id); }));
-        else shareEmail(created, r, back).then(ok => { if (ok) q.markEmailed.run(r.id); });
-      }
+      for (const r of q.recipients.all(created.id)) deliverShare(created, r, !!r.hidden && !!original);
       console.log(`[neerly:share] ${u.email} started ${minutes}m ${mode}${showLoc ? '' : ' (no location)'} share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
       return json(res, 200, { share: senderView(created), newBadges, shareBackTo: original ? original.sender_name : null });
     }
@@ -1435,6 +1451,29 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
       }
 
+      // v0.7b.1: add people to a share that's already running (they get the same email or notification).
+      if (action === 'recipients' && M === 'POST') {
+        const u = requireUser(req);
+        const share = loadOwnedShare(token, u);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
+        const existing = q.recipients.all(share.id);
+        const rs = collectRecipients(u, (await readBody(req)).recipients, new Set(existing.map(r => r.email)));
+        if (!rs.length) throw new HttpError(400, 'Pick someone who isn’t on this share yet');
+        if (existing.length + rs.length > MAX_RECIPIENTS) throw new HttpError(400, `Up to ${MAX_RECIPIENTS} people per share`);
+        const t = now();
+        db.transaction(() => {
+          for (const r of rs) {
+            q.insertRecipient.run(share.id, r.email, r.nickname, randToken(12), 0, r.handle);
+            q.upsertContact.run(u.email, r.email, r.nickname, t, r.known ? 1 : 0);
+          }
+        })();
+        const added = new Set(rs.map(r => r.email));
+        for (const r of q.recipients.all(share.id)) if (added.has(r.email)) deliverShare(share, r, false);
+        checkBadges(u.email); // "My People" counts everyone you've shared with
+        console.log(`[neerly:share] ${u.email} added ${rs.length} to ${token}`);
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0), added: rs.length });
+      }
+
       if (action === 'extend' && M === 'POST') {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
@@ -1479,7 +1518,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const name = recipient ? recipLabel(recipient) : me ? me.name : 'Someone';
         const counts = reactionCounts(share);
         counts[emoji] = (counts[emoji] || 0) + 1;
-        db.transaction(() => { q.insertReaction.run(share.id, emoji, name, t); q.setReactions.run(JSON.stringify(counts), share.id); })();
+        db.transaction(() => { q.insertReaction.run(share.id, emoji, name, t, recipient ? recipient.id : null); q.setReactions.run(JSON.stringify(counts), share.id); })();
         if (t - (reactPushedAt.get(share.id) || 0) >= PUSH_REACT_GAP_MS) {
           reactPushedAt.set(share.id, t);
           pushTo(share.sender_email, { title: `${emoji} ${name === 'Someone' ? 'Someone reacted' : name}`, body: `${name === 'Someone' ? 'Someone' : 'They'} reacted to your share`, tag: `react-${share.token}`, ttl: 600 });
