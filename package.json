@@ -9,6 +9,7 @@
     "build": "npm install"
   },
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "better-sqlite3": "^11.1.2",
     "resend": "^3.5.0",
     "web-push": "^3.6.7",

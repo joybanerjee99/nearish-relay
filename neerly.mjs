@@ -7,6 +7,8 @@
 // which the Watching map needs: shares are matched to accounts by email address.
 // v0.7b: push notifications (Web Push), reactions from watchers, quick starts (presets),
 // and adding friends by @username (their email address stays private).
+// v0.8: destinations (a dropped pin or a saved place, with a name), ETA and arrival, "Let them know if I'm late",
+// link previews that name the sender, and the in-app notifications list.
 //
 // Mounted on the existing nearish-relay HTTP server. Every route lives under
 // /neerly/... and every table is prefixed neerly_ so nothing collides with
@@ -18,6 +20,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import webpush from 'web-push';
+import { previewSvg, previewText, renderPng } from './neerly-preview.mjs';
 
 const SESSION_MS       = 30 * 24 * 60 * 60 * 1000; // 30 days
 const RESET_MS          = 15 * 60 * 1000;            // 15 minutes
@@ -77,6 +80,20 @@ const PUSH_REACT_GAP_MS  = 20 * 1000;            // reactions buzz the sender at
 const MAX_PUSH_SUBS      = 10;                   // devices per account
 const MAX_PRESETS        = 8;
 const PRESET_NAME_MAX    = 30;
+// v0.8 — arrival and ETA
+const ARRIVE_M           = 60;                   // within 60 m of the pin counts as arrived…
+const ARRIVE_MAX_M       = 150;                  // …or within the fix's accuracy, up to 150 m
+const MOVING_MPS         = 0.4;                  // slower than this, the ETA isn't shown (standing still)
+const SPEED_STALE_MS     = 3 * 60 * 1000;        // a speed older than this isn't used
+const NEAR_S             = 5 * 60;               // "Ana is about 5 min away"
+const NEAR_MIN_AGE_MS    = 2 * 60 * 1000;        // …not in the first 2 minutes of a share
+const LATE_BY            = [10, 15, 20, 30, 45, 60, 90, 120]; // "I should be there in…" (minutes)
+const LATE_GRACE         = [5, 10, 15, 30];      // how long to wait before nudging the watchers
+const LATE_EXTEND        = [10, 15, 30];
+const ETA_MAX_MIN        = 600;                  // a typed ETA can be up to 10 hours
+const PLACE_NAME_MAX     = 40;
+const INBOX_KEEP_MS      = 7 * 24 * 60 * 60 * 1000; // the in-app notifications list keeps a week
+const INBOX_MAX          = 100;
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // NEERLY_URL is where emailed links point: the page itself (…/neerly.html) or, from v0.7a, the
@@ -86,6 +103,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // ("What I'm up to") that forwards straight to the app with the same query string.
   const NOW_PAGE_URL = /\/$/.test(PAGE_URL) ? PAGE_URL + 'neerly-now.html' : PAGE_URL.replace(/neerly\.html$/, 'neerly-now.html');
   const shareBase = (share) => (share.mode === 'now' && NOW_PAGE_URL !== PAGE_URL ? NOW_PAGE_URL : PAGE_URL);
+  // v0.8: with NEERLY_LINK_BASE set (e.g. https://go.neerly.net, pointing at this server), share links go through
+  // /neerly/p/<token>, which gives Messages a preview naming the sender, then forwards to the page.
+  const LINK_BASE = (process.env.NEERLY_LINK_BASE || '').replace(/\/$/, '');
+  const shareLink = (share, r) => LINK_BASE
+    ? `${LINK_BASE}/neerly/p/${share.token}${r ? `?r=${r.view_token}` : ''}`
+    : `${shareBase(share)}?share=${share.token}${r ? `&r=${r.view_token}` : ''}`;
   const FROM = process.env.NEERLY_FROM_EMAIL || fromEmail || 'Neerly <onboarding@resend.dev>';
   const PEPPER = process.env.PASSWORD_SALT || '';
   if (!PEPPER) console.warn('[neerly] PASSWORD_SALT not set — add it in Render before real users sign up');
@@ -231,6 +254,18 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_presets_email ON neerly_presets(email);
+    -- v0.8: the in-app notifications list (what was sent as notifications), kept 7 days
+    CREATE TABLE IF NOT EXISTS neerly_inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      kind TEXT,
+      title TEXT NOT NULL,
+      body TEXT,
+      url TEXT,
+      created_at INTEGER NOT NULL,
+      read_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_inbox_email ON neerly_inbox(email, id);
     -- v0.7b: small server settings (the push keys)
     CREATE TABLE IF NOT EXISTS neerly_meta (
       key TEXT PRIMARY KEY,
@@ -264,6 +299,20 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_share_recipients', 'handle', 'TEXT');               // v0.7b: picked by @username: show that, not the address
   addCol('neerly_shares', 'reactions', 'TEXT');                      // v0.7b: JSON counts, e.g. {"❤️":3}
   addCol('neerly_reactions', 'recipient_id', 'INTEGER');            // v0.7b.1: which invited watcher reacted (null: a link viewer)
+  // v0.8: destination (wiped with the location), speed for the ETA, arrival, and the late check
+  addCol('neerly_shares', 'dest_lat', 'REAL');
+  addCol('neerly_shares', 'dest_lng', 'REAL');
+  addCol('neerly_shares', 'speed_mps', 'REAL');
+  addCol('neerly_shares', 'speed_at', 'INTEGER');
+  addCol('neerly_shares', 'battery', 'REAL');
+  addCol('neerly_shares', 'near_pushed', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_shares', 'arrived_at', 'INTEGER');
+  addCol('neerly_shares', 'late_on', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('neerly_shares', 'late_due', 'INTEGER');
+  addCol('neerly_shares', 'late_grace', 'INTEGER');
+  addCol('neerly_shares', 'late_warned_at', 'INTEGER');
+  addCol('neerly_shares', 'late_nudged_at', 'INTEGER');
+  addCol('neerly_shares', 'eta_at', 'INTEGER');                      // v0.8: the sender's own ETA ("I'll be there in 18 min"), as a time
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -383,7 +432,27 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     shareByToken:  db.prepare('SELECT * FROM neerly_shares WHERE token = ?'),
     activeShareFor:db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL AND expires_at > ? ORDER BY started_at DESC LIMIT 1'),
     endShare:      db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL WHERE id = ? AND ended_at IS NULL'),
-    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL WHERE id = ?'),
+    // v0.8: the destination pin, speed and battery go with the location; the place's name (the note) stays for the summary
+    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL, dest_lat = NULL, dest_lng = NULL, speed_mps = NULL, speed_at = NULL, battery = NULL WHERE id = ?'),
+    setDest:       db.prepare('UPDATE neerly_shares SET dest_lat = ?, dest_lng = ?, note = ?, near_pushed = 0 WHERE id = ?'),
+    setEtaAt:      db.prepare('UPDATE neerly_shares SET eta_at = ?, near_pushed = 0 WHERE id = ?'),
+    lateDueToEta:  db.prepare('UPDATE neerly_shares SET late_due = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ? AND late_on = 1'),
+    nearByEta:     db.prepare('SELECT * FROM neerly_shares WHERE eta_at IS NOT NULL AND ended_at IS NULL AND near_pushed = 0 AND eta_at <= ? AND started_at <= ?'),
+    setSpeed:      db.prepare('UPDATE neerly_shares SET speed_mps = ?, speed_at = ? WHERE id = ?'),
+    setBattery:    db.prepare('UPDATE neerly_shares SET battery = ? WHERE id = ?'),
+    setNearPushed: db.prepare('UPDATE neerly_shares SET near_pushed = 1 WHERE id = ?'),
+    setArrived:    db.prepare('UPDATE neerly_shares SET arrived_at = ? WHERE id = ?'),
+    setLate:       db.prepare('UPDATE neerly_shares SET late_on = ?, late_due = ?, late_grace = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ?'),
+    extendLate:    db.prepare('UPDATE neerly_shares SET late_due = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ?'),
+    lateOpen:      db.prepare('SELECT * FROM neerly_shares WHERE late_on = 1 AND ended_at IS NULL AND late_nudged_at IS NULL AND late_due <= ?'),
+    setLateWarned: db.prepare('UPDATE neerly_shares SET late_warned_at = ? WHERE id = ?'),
+    setLateNudged: db.prepare('UPDATE neerly_shares SET late_nudged_at = ? WHERE id = ?'),
+    inboxAdd:      db.prepare('INSERT INTO neerly_inbox (email, kind, title, body, url, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    inbox:         db.prepare(`SELECT * FROM neerly_inbox WHERE email = ? ORDER BY id DESC LIMIT ${INBOX_MAX}`),
+    inboxUnread:   db.prepare('SELECT COUNT(*) n FROM neerly_inbox WHERE email = ? AND read_at IS NULL'),
+    inboxRead:     db.prepare('UPDATE neerly_inbox SET read_at = ? WHERE email = ? AND read_at IS NULL'),
+    inboxClear:    db.prepare('DELETE FROM neerly_inbox WHERE email = ?'),
+    inboxPurge:    db.prepare('DELETE FROM neerly_inbox WHERE created_at < ?'),
     openSharesFor: db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL'),
     expiredOpen:   db.prepare('SELECT * FROM neerly_shares WHERE ended_at IS NULL AND expires_at <= ?'),
     shareById:     db.prepare('SELECT * FROM neerly_shares WHERE id = ?'),
@@ -464,6 +533,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     }
     db.prepare('DELETE FROM neerly_push_subs WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_presets WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_inbox WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_shares WHERE sender_email = ?').run(email);
     db.prepare('DELETE FROM neerly_update_requests WHERE requester_email = ?').run(email);
     db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ?').run(email);
@@ -743,7 +813,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   };
 
   function shareEmail(share, recipient, isShareBack) {
-    const link = `${shareBase(share)}?share=${share.token}&r=${recipient.view_token}`;
+    const link = shareLink(share, recipient);
     const t = shareTitle(share, isShareBack);
     const html = emailShell(`
       <p style="font-size:20px;font-weight:600;margin:0 0 8px">${esc(t)} 🧡</p>
@@ -799,6 +869,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // Sends to every device this account turned notifications on for. Devices the push service says are
   // gone (404/410) are forgotten. Never throws, never blocks a response. Returns how many devices it reached.
   async function pushTo(email, msg) {
+    // v0.8: everything sent as a notification also goes in the in-app list (not the "Send me a test" one).
+    if (msg.tag !== 'test') { try { q.inboxAdd.run(email, String(msg.tag || '').split('-')[0] || null, msg.title, msg.body || '', msg.url || '', now()); } catch {} }
     const subs = q.pushSubsFor.all(email);
     if (PUSH_LOG) { try { fs.appendFileSync(PUSH_LOG, JSON.stringify({ to: email, devices: subs.length, ...msg }) + '\n'); } catch {} }
     if (!subs.length) return 0;
@@ -818,7 +890,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   }
   const hasPush = (email) => q.pushSubsFor.all(email).length > 0;
   // The live link a recipient gets, for notifications that open a share.
-  const viewLink = (share, r) => `${shareBase(share)}?share=${share.token}${r ? `&r=${r.view_token}` : ''}`;
+  const viewLink = (share, r) => shareLink(share, r);
   // What the sender sees as a watcher's name: their own nickname for them, or the @username they picked.
   const recipLabel = (r) => r.nickname || (r.handle ? '@' + r.handle : r.hidden ? 'Someone' : r.email.split('@')[0]);
   // One line about the sender's own share, for the notifications they get about it.
@@ -837,6 +909,115 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     const icon = isShareBack ? '🔁' : share.mode === 'now' ? '📍' : '👣';
     return pushTo(r.email, { title: `${icon} ${shareTitle(share, isShareBack)}`, body: share.mode === 'now' ? 'Tap to see it live' : 'Tap to watch live', url: viewLink(share, r), tag: `share-${share.token}` });
   }
+
+  // ── v0.8 Arrival, ETA, "Let them know if I'm late" ────────────────────────────
+  // The destination is a pin the sender dropped (or a saved place on their phone) plus the name they typed.
+  // It lives on the share only while it runs, like the location. ETA = straight-line distance ÷ recent speed.
+  function arriveRadius(accuracy) { return Math.max(ARRIVE_M, Math.min(Number(accuracy) || 0, ARRIVE_MAX_M)); }
+  function destOf(share) {
+    return share.dest_lat != null ? { lat: share.dest_lat, lng: share.dest_lng, name: share.note || '' } : null;
+  }
+  // Seconds to arrive, or null when it can't be told (no destination, no location, or not moving).
+  // The sender can type their own ETA ("18 min"); it counts down and wins over the estimate until they clear it.
+  function etaOf(share) {
+    const manual = share.eta_at ? Math.max(0, Math.round((share.eta_at - now()) / 1000)) : null;
+    let distanceM = null, auto = null;
+    if (share.dest_lat != null && share.lat != null) {
+      const d = meters({ lat: share.lat, lng: share.lng }, { lat: share.dest_lat, lng: share.dest_lng });
+      const fresh = share.speed_at && now() - share.speed_at < SPEED_STALE_MS;
+      const v = fresh ? share.speed_mps : null;
+      distanceM = Math.round(d);
+      auto = v != null && v >= MOVING_MPS ? Math.round(d / v) : null;
+    }
+    if (manual == null && distanceM == null) return null;
+    return { distanceM, seconds: manual ?? auto, manual: manual != null };
+  }
+  function lateOf(share) {
+    if (!share.late_on) return null;
+    return { on: true, dueAt: share.late_due, graceMin: share.late_grace, warnedAt: share.late_warned_at || null, nudgedAt: share.late_nudged_at || null };
+  }
+  // Notifications to everyone on a share who has Neerly (same rule as for "… is on the way to …").
+  function pushRecipients(share, msg) {
+    for (const r of q.recipients.all(share.id)) {
+      const u = q.userByEmail.get(r.email);
+      if (!u || (!u.email_verified_at && !r.handle && !r.hidden)) continue;
+      pushTo(r.email, { ...msg, url: viewLink(share, r) });
+    }
+  }
+  const minsText = (s) => { const m = Math.max(1, Math.round(s / 60)); return `${m} min`; };
+  // Called after each location update: speed, "about 5 min away", and arrival (which ends the share).
+  function afterMove(share, prev, t) {
+    if (share.dest_lat == null) return share;
+    const here = { lat: share.lat, lng: share.lng };
+    const d = meters(here, { lat: share.dest_lat, lng: share.dest_lng });
+    if (d <= arriveRadius(share.accuracy)) {
+      q.setArrived.run(t, share.id);
+      finalizeShare(share, t);
+      const where = share.note ? ` at ${share.note}` : '';
+      pushRecipients(share, { title: `🎉 ${share.sender_name} arrived${where}`, body: 'Their share has ended.', tag: `arrived-${share.token}` });
+      console.log(`[neerly:arrive] ${share.sender_email} arrived (${Math.round(d)} m) ${share.token}`);
+      return q.shareByToken.get(share.token);
+    }
+    // Speed from the last two fixes (smoothed); jitter under 10 m counts as standing still.
+    if (prev && prev.lat != null && prev.loc_at) {
+      const dt = (t - prev.loc_at) / 1000;
+      if (dt >= 5 && dt <= 600 && (share.accuracy == null || share.accuracy <= 100)) {
+        const step = meters({ lat: prev.lat, lng: prev.lng }, here);
+        const v = step < 10 ? 0 : step / dt;
+        if (v <= TRAIL_MAX_SPEED) {
+          const speed = prev.speed_mps != null && prev.speed_at && t - prev.speed_at < SPEED_STALE_MS ? prev.speed_mps * 0.6 + v * 0.4 : v;
+          q.setSpeed.run(speed, t, share.id);
+          share = q.shareByToken.get(share.token);
+        }
+      }
+    }
+    const eta = etaOf(share);
+    if (!share.near_pushed && eta?.seconds != null && eta.seconds <= NEAR_S && t - share.started_at > NEAR_MIN_AGE_MS) {
+      q.setNearPushed.run(share.id);
+      const where = share.note ? ` from ${share.note}` : '';
+      pushRecipients(share, { title: `⏱ ${share.sender_name} is about ${minsText(eta.seconds)} away${where}`, body: 'Tap to watch them arrive.', tag: `near-${share.token}` });
+    }
+    return share;
+  }
+  // Runs every 30 s: the sender's heads-up at the expected time, then the watchers' nudge after the grace period.
+  // A typed ETA counts down on its own, so "about 5 min away" for it is checked here rather than on movement.
+  function checkNearByEta(t) {
+    for (const s of q.nearByEta.all(t + NEAR_S * 1000, t - NEAR_MIN_AGE_MS)) {
+      q.setNearPushed.run(s.id);
+      const left = Math.max(60, s.eta_at - t) / 1000;
+      const where = s.note ? ` from ${s.note}` : '';
+      pushRecipients(s, { title: `⏱ ${s.sender_name} is about ${minsText(left)} away${where}`, body: 'Tap to watch them arrive.', tag: `near-${s.token}` });
+    }
+  }
+  function checkLate(t) {
+    for (const s of q.lateOpen.all(t)) {
+      if (!s.late_warned_at && t >= s.late_due) {
+        q.setLateWarned.run(t, s.id);
+        pushTo(s.sender_email, { title: '⏰ Running late?', body: `Your watchers get a gentle nudge in ${s.late_grace} min unless you arrive. Open Neerly to add time or turn it off.`, tag: `late-${s.token}` });
+      } else if (s.late_warned_at && !s.late_nudged_at && t >= s.late_due + s.late_grace * 60000) {
+        q.setLateNudged.run(t, s.id);
+        const where = s.note ? ` at ${s.note}` : '';
+        const seen = s.loc_at ? Math.max(0, Math.round((t - s.loc_at) / 60000)) : null;
+        const bits = [seen != null ? (seen < 1 ? 'Last update just now' : `Last update ${seen} min ago`) : 'No location yet'];
+        if (s.battery != null) bits.push(`battery ${Math.round(s.battery * 100)}%`);
+        pushRecipients(s, { title: `⏰ ${s.sender_name} hasn’t arrived${where} yet`, body: bits.join(' · ') + '. Tap to see where they are.', tag: `late-${s.token}` });
+        console.log(`[neerly:late] nudged watchers of ${s.token}`);
+      }
+    }
+  }
+
+  function parseDest(b) {
+    const x = b?.dest ?? b;
+    if (!x || !validCoord(x.lat, x.lng)) return null;
+    return { lat: Number(x.lat), lng: Number(x.lng), name: cleanNote(String(x.name ?? '').slice(0, PLACE_NAME_MAX)) || null };
+  }
+  function parseLate(b) {
+    const x = b?.late ?? b;
+    const byMin = Number(x?.byMin), graceMin = Number(x?.graceMin);
+    return LATE_BY.includes(byMin) && LATE_GRACE.includes(graceMin) ? { byMin, graceMin } : null;
+  }
+  const previewCache = new Map(); // token -> { key, png }
+
   // v0.7b: contacts as the page sees them. Someone added by @username has no address here, only the handle.
   function contactOut(c) {
     if (!c) return null;
@@ -910,7 +1091,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (anon) for (const [, ts] of anon) if (t - ts < WATCHING_MS) anonWatching++;
     return {
       token: share.token,
-      link: `${shareBase(share)}?share=${share.token}`,
+      link: shareLink(share),
       active: isActive(share),
       startedAt: share.started_at,
       expiresAt: share.expires_at,
@@ -920,6 +1101,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       note: share.note || '',
       showLocation: !!share.show_loc,
       weather: weatherOf(share),
+      dest: destOf(share), eta: live ? etaOf(share) : null, arrivedAt: share.arrived_at || null, late: live ? lateOf(share) : null, // v0.8
       location: share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
       recipients: q.recipients.all(share.id).map(r => ({
         // v0.7b: someone picked by @username shows as that; their address stays private.
@@ -1081,7 +1263,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           name: share.sender_name, username: sender?.username || null,
           avatar: sender?.avatar || null, outfit: look2.outfit,
           mode: share.mode || 'way', note: share.note || '', showLocation: !!share.show_loc,
-          weather: weatherOf(share),
+          weather: weatherOf(share), dest: share.show_loc ? destOf(share) : null, eta: share.show_loc ? etaOf(share) : null, // v0.8
           location: share.show_loc && share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
           startedAt: share.started_at, expiresAt: share.expires_at,
         });
@@ -1176,6 +1358,67 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       deleteAccount(u.email);
       console.log(`[neerly:auth] deleted account ${u.email}`);
       return json(res, 200, { ok: true });
+    }
+
+    // ---- v0.8: the in-app notifications list (kept 7 days; the user can clear it any time) ----
+    if (p === '/neerly/inbox' && M === 'GET') {
+      const u = requireUser(req);
+      const unread = q.inboxUnread.get(u.email).n;
+      if (url.searchParams.get('count') === '1') return json(res, 200, { unread });
+      return json(res, 200, { unread, items: q.inbox.all(u.email).map(x => ({ id: x.id, kind: x.kind, title: x.title, body: x.body || '', url: x.url || '', at: x.created_at, read: !!x.read_at })) });
+    }
+    if (p === '/neerly/inbox/read' && M === 'POST') {
+      const u = requireUser(req);
+      q.inboxRead.run(now(), u.email);
+      return json(res, 200, { ok: true, unread: 0 });
+    }
+    if (p === '/neerly/inbox/clear' && M === 'POST') {
+      const u = requireUser(req);
+      q.inboxClear.run(u.email);
+      return json(res, 200, { ok: true, items: [], unread: 0 });
+    }
+
+    // ---- v0.8: link previews that name the sender ----
+    // Share links point here (when NEERLY_LINK_BASE is set). Messages and WhatsApp read the tags and the
+    // card image; people are sent straight on to the live page with the same share and recipient.
+    const pv = p.match(/^\/neerly\/p\/([A-Za-z0-9_-]{8,64})(\.png)?$/);
+    if (pv && M === 'GET') {
+      const share0 = q.shareByToken.get(pv[1]);
+      if (!share0) { res.writeHead(302, { Location: PAGE_URL }); res.end(); return; }
+      const share = endIfExpired(share0);
+      const sender = q.userByEmail.get(share.sender_email);
+      const info = { senderName: share.sender_name, note: share.note || '', mode: share.mode || 'way', showLocation: !!share.show_loc,
+        active: isActive(share), expiresAt: share.expires_at, senderAvatar: sender?.avatar || null, senderOutfit: lookFor(sender).outfit };
+      if (pv[2]) {
+        // The card image. Cached a few minutes per share (it only changes with the text, buddy or end).
+        const key = JSON.stringify([info.senderName, info.note, info.mode, info.showLocation, info.active, info.senderAvatar, info.senderOutfit, Math.round((info.expiresAt - now()) / 300000)]);
+        let hit = previewCache.get(share.token);
+        if (!hit || hit.key !== key) {
+          hit = { key, png: renderPng(previewSvg(info)) };
+          previewCache.set(share.token, hit);
+          if (previewCache.size > 300) previewCache.delete(previewCache.keys().next().value);
+        }
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=300' });
+        res.end(hit.png);
+        return;
+      }
+      const r = url.searchParams.get('r');
+      const dest = `${share.mode === 'now' && NOW_PAGE_URL !== PAGE_URL ? NOW_PAGE_URL : PAGE_URL}?share=${share.token}${r && /^[A-Za-z0-9_-]{6,40}$/.test(r) ? `&r=${r}` : ''}`;
+      const { title, sub } = previewText(info);
+      const img = `${LINK_BASE || ''}/neerly/p/${share.token}.png`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)} · Neerly</title>
+<meta name="description" content="${esc(sub)}. Opens in your browser. No app, no sign-up. It ends on its own.">
+<meta property="og:title" content="${esc(title)}">
+<meta property="og:description" content="${esc(sub)}. Opens in your browser. No app, no sign-up. It ends on its own.">
+<meta property="og:image" content="${esc(img)}"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
+<meta property="og:type" content="website"><meta property="og:site_name" content="Neerly"><meta name="twitter:card" content="summary_large_image">
+<meta http-equiv="refresh" content="0;url=${esc(dest)}">
+<script>location.replace(${JSON.stringify(dest)});</script>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fffaf6;font-family:system-ui,-apple-system,sans-serif;color:#6b5a50}a{color:#c94a18;font-weight:600}</style>
+</head><body><p><a href="${esc(dest)}">Open Neerly</a></p></body></html>`);
+      return;
     }
 
     // ---- v0.7b: push notifications ----
@@ -1291,11 +1534,16 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     // ---- Create share ----
     if (p === '/neerly/shares' && M === 'POST') {
       const u = requireUser(req);
-      const { minutes, recipients, lat, lng, accuracy, shareBack, tzOffset, mode: rawMode, note: rawNote, showLocation } = await readBody(req);
+      const { minutes, recipients, lat, lng, accuracy, shareBack, tzOffset, mode: rawMode, note: rawNote, showLocation, dest: rawDest, late: rawLate } = await readBody(req);
       // v0.6: mode defaults to 'way' so older pages keep working.
       const mode = rawMode == null ? 'way' : String(rawMode);
       if (!MODES.includes(mode)) throw new HttpError(400, 'Unknown share mode');
-      const note = cleanNote(rawNote) || null;
+      // v0.8: On my way can carry a destination (a pin + the name the sender typed) and the late check.
+      const dest = rawMode !== 'now' && rawDest ? parseDest({ dest: rawDest }) : null;
+      if (rawDest && rawMode !== 'now' && !dest) throw new HttpError(400, 'That destination pin doesn’t look right');
+      const late = dest && rawLate ? parseLate({ late: rawLate }) : null;
+      if (rawLate && dest && !late) throw new HttpError(400, 'Pick when you expect to arrive and how long to wait');
+      const note = cleanNote(rawNote) || dest?.name || null;
       const showLoc = mode === 'way' ? true : showLocation !== false; // On my way always shows the map
       if (!durationsFor(mode).includes(Number(minutes))) throw new HttpError(400, durationError(mode));
       if (showLoc && !validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
@@ -1330,6 +1578,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           showLoc ? Number(lat) : null, showLoc ? Number(lng) : null, showLoc ? numOrNull(accuracy) : null, showLoc ? t : null,
           mode, note, showLoc ? 1 : 0);
         if (mode === 'way') addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
+        if (dest) q.setDest.run(dest.lat, dest.lng, note, info.lastInsertRowid);
+        if (late) q.setLate.run(1, t + late.byMin * 60000, late.graceMin, info.lastInsertRowid);
         countShareStart(u.email, t, Number(tzOffset));
         for (const r of rs) {
           q.insertRecipient.run(info.lastInsertRowid, r.email, r.nickname, randToken(12), r.hidden, r.handle);
@@ -1401,6 +1651,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
             senderTrail: lookFor(sender).trail,
             canShareBack: now() - Math.min(share.ended_at || share.expires_at, now()) <= SHARE_BACK_WINDOW,
             reactions: REACTIONS, // v0.7b
+            dest: active ? destOf(share) : null, eta: active ? etaOf(share) : null, arrivedAt: share.arrived_at || null, // v0.8
             active,
             startedAt: share.started_at,
             expiresAt: share.expires_at,
@@ -1426,7 +1677,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const u = requireUser(req);
         const share = loadOwnedShare(token, u);
         if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
-        const { lat, lng, accuracy, trailFrom, rxFrom } = await readBody(req);
+        const { lat, lng, accuracy, trailFrom, rxFrom, battery } = await readBody(req);
+        if (Number.isFinite(Number(battery)) && battery !== null && Number(battery) >= 0 && Number(battery) <= 1) q.setBattery.run(Number(battery), share.id);
         // Right now with the location hidden: nothing is stored, whatever the page sends.
         if (!share.show_loc) return json(res, 200, { share: senderView(share, trailFrom, rxFrom) });
         if (!validCoord(lat, lng)) throw new HttpError(400, 'Invalid location');
@@ -1435,7 +1687,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           q.setLocation.run(Number(lat), Number(lng), numOrNull(accuracy), t, share.id);
           if ((share.mode || 'way') === 'way') addTrailPoint(share.id, Number(lat), Number(lng), numOrNull(accuracy), t);
         })();
-        const fresh = q.shareByToken.get(token);
+        const fresh = afterMove(q.shareByToken.get(token), share, t); // v0.8: speed, "5 min away", arrival
         refreshWeather(fresh);
         return json(res, 200, { share: senderView(fresh, trailFrom, rxFrom) });
       }
@@ -1448,6 +1700,63 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const note = cleanNote((await readBody(req)).note) || null;
         if (!note && share.mode === 'now' && !share.show_loc) throw new HttpError(400, 'Add what you’re up to');
         q.setNote.run(note, share.id);
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
+      }
+
+      // v0.8: set, change or clear the destination while the share runs (On my way only).
+      if (action === 'dest' && M === 'POST') {
+        const u = requireUser(req);
+        const share = loadOwnedShare(token, u);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
+        if (share.mode !== 'way') throw new HttpError(400, 'Destinations are for On my way shares');
+        const body = await readBody(req);
+        if (body.clear) {
+          q.setDest.run(null, null, share.note, share.id);
+          q.setLate.run(0, null, null, share.id);
+        } else {
+          const dest = parseDest(body);
+          if (!dest) throw new HttpError(400, 'Drop a pin for where you’re going');
+          q.setDest.run(dest.lat, dest.lng, dest.name || share.note, share.id);
+        }
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
+      }
+
+      // v0.8: the sender's own ETA: { minutes } ("I'll be there in 18 min") or { clear: true } (back to the estimate).
+      // With the late check on, the typed time becomes the expected arrival time.
+      if (action === 'eta' && M === 'POST') {
+        const u = requireUser(req);
+        const share = loadOwnedShare(token, u);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
+        if (share.mode !== 'way') throw new HttpError(400, 'ETAs are for On my way shares');
+        const body = await readBody(req);
+        if (body.clear) q.setEtaAt.run(null, share.id);
+        else {
+          const m = Number(body.minutes);
+          if (!Number.isInteger(m) || m < 1 || m > ETA_MAX_MIN) throw new HttpError(400, 'Type the minutes, from 1 to 600');
+          const at = now() + m * 60000;
+          q.setEtaAt.run(at, share.id);
+          q.lateDueToEta.run(at, share.id);
+        }
+        return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
+      }
+
+      // v0.8: "Let them know if I'm late": turn on (needs a destination), add time, or turn off.
+      if (action === 'late' && M === 'POST') {
+        const u = requireUser(req);
+        const share = loadOwnedShare(token, u);
+        if (!isActive(share)) return json(res, 410, { error: 'This share has ended', share: senderView(share) });
+        const body = await readBody(req);
+        if (body.action === 'off') q.setLate.run(0, null, null, share.id);
+        else if (body.action === 'extend') {
+          if (!share.late_on) throw new HttpError(400, '“Let them know if I’m late” isn’t on');
+          if (!LATE_EXTEND.includes(Number(body.minutes))) throw new HttpError(400, 'Add 10, 15 or 30 minutes');
+          q.extendLate.run(Math.max(share.late_due, now()) + Number(body.minutes) * 60000, share.id);
+        } else {
+          if (share.dest_lat == null && !share.eta_at) throw new HttpError(400, 'Set a destination or your ETA first');
+          const late = parseLate(body);
+          if (!late) throw new HttpError(400, 'Pick when you expect to arrive and how long to wait');
+          q.setLate.run(1, now() + late.byMin * 60000, late.graceMin, share.id);
+        }
         return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
       }
 
@@ -1587,13 +1896,16 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     q.purgeSessions.run(t);
     q.purgeResets.run(t);
     q.purgeVerify.run(t);
+    checkLate(t);                             // v0.8
+    checkNearByEta(t);
+    q.inboxPurge.run(t - INBOX_KEEP_MS);      // v0.8: the notifications list keeps a week
     for (const [shareId] of reactLimits) if (!q.shareById.get(shareId) || q.shareById.get(shareId).ended_at) reactLimits.delete(shareId);
     for (const [shareId, viewers] of anonViewers) {
       for (const [v, ts] of viewers) if (t - ts > WATCHING_MS * 3) viewers.delete(v);
       if (!viewers.size) anonViewers.delete(shareId);
     }
   }
-  setInterval(sweep, 30 * 1000).unref();
+  setInterval(sweep, Number(process.env.NEERLY_SWEEP_MS) || 30 * 1000).unref(); // tests use a shorter interval
   sweep();
 
   return { handle };
