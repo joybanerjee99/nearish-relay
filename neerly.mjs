@@ -354,6 +354,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       UNIQUE (meetup_id, email)
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_mm_email ON neerly_meetup_members(email);
+    -- v0.9.1: invitations (by @username, or a signed-in person who opened the invite link) until they join or decline
+    CREATE TABLE IF NOT EXISTS neerly_meetup_invites (
+      meetup_id INTEGER NOT NULL,
+      email TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      UNIQUE (meetup_id, email)
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_mi_email ON neerly_meetup_invites(email);
     CREATE TABLE IF NOT EXISTS neerly_counters (
       day TEXT NOT NULL,
       key TEXT NOT NULL,
@@ -1243,6 +1251,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     setMeetup:   db.prepare('UPDATE neerly_shares SET meetup_id = ? WHERE id = ?'),
     membershipsOf: db.prepare('SELECT meetup_id FROM neerly_meetup_members WHERE email = ?'),
     hostedBy:    db.prepare('SELECT id FROM neerly_meetups WHERE host_email = ?'),
+    invite:      db.prepare('INSERT OR IGNORE INTO neerly_meetup_invites (meetup_id, email, created_at) VALUES (?, ?, ?)'),
+    uninvite:    db.prepare('DELETE FROM neerly_meetup_invites WHERE meetup_id = ? AND email = ?'),
+    invitedTo:   db.prepare(`SELECT m.* FROM neerly_meetup_invites i JOIN neerly_meetups m ON m.id = i.meetup_id
+                             WHERE i.email = ? AND m.ended_at IS NULL AND m.ends_at > ? ORDER BY m.starts_at`),
+    delInvites:  db.prepare('DELETE FROM neerly_meetup_invites WHERE meetup_id = ?'),
+    delInvitesOf: db.prepare('DELETE FROM neerly_meetup_invites WHERE email = ?'),
   };
   const meetupLink = (m) => LINK_BASE ? `${LINK_BASE}/neerly/m/${m.token}` : `${PAGE_URL}?meetup=${m.token}`;
   const meetupAppLink = (m) => `${PAGE_URL}?meetup=${m.token}`; // notifications open the page directly (same site as the app)
@@ -1329,7 +1343,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     count('meetup:arrived');
   }
   function endMeetupShares(m, t) { for (const s of mq.openShares.all(m.id)) finalizeShare(s, t); }
-  function deleteMeetup(id) { db.transaction(() => { mq.delMembers.run(id); mq.del.run(id); })(); }
+  function deleteMeetup(id) { db.transaction(() => { mq.delMembers.run(id); mq.delInvites.run(id); mq.del.run(id); })(); }
   function meetupSweep(t) {
     for (const m of mq.toRemind.all(MEETUP_REMIND_MS, t, t)) {
       mq.reminded.run(m.id);
@@ -1345,6 +1359,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   function deleteMeetupsOf(email) {
     for (const { id } of mq.hostedBy.all(email)) { const m = mq.byId.get(id); if (m) endMeetupShares(m, now()); deleteMeetup(id); }
     for (const { meetup_id } of mq.membershipsOf.all(email)) mq.leave.run(meetup_id, email);
+    mq.delInvitesOf.run(email);
   }
   function inviteEmail(m, inviter, to) {
     const when = meetupWhen(m);
@@ -1413,6 +1428,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const u = requireUser(req);
       const t = now();
       const list = mq.mine.all(u.email, t).filter(m => !m.ended_at || t - m.ended_at < MEETUP_KEEP_MS).map(m => meetupListItem(m, u.email));
+      // v0.9.1: invitations not yet answered come first
+      const invited = mq.invitedTo.all(u.email, t).filter(m => !mq.member.get(m.id, u.email)).map(m => ({ ...meetupListItem(m, u.email), myState: 'invited', hostName: q.userByEmail.get(m.host_email)?.name || 'Someone' }));
+      list.unshift(...invited);
       return json(res, 200, { meetups: list }), true;
     }
 
@@ -1452,7 +1470,12 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (!m0.ended_at && m0.ends_at <= now()) { mq.end.run(m0.ends_at, m0.id); endMeetupShares(m0, m0.ends_at); }
     const m = mq.byId.get(m0.id);
 
-    if (!action && M === 'GET') return json(res, 200, { meetup: meetupView(m, authUser(req)) }), true;
+    if (!action && M === 'GET') {
+      const viewer = authUser(req);
+      // v0.9.1: a signed-in person opening the invite keeps it in their Meetups list until they answer
+      if (viewer && meetupLive(m) && !mq.member.get(m.id, viewer.email)) mq.invite.run(m.id, viewer.email, now());
+      return json(res, 200, { meetup: meetupView(m, viewer) }), true;
+    }
 
     const u = requireUser(req);
     if (action === 'join' && M === 'POST') {
@@ -1460,10 +1483,15 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       if (!mq.member.get(m.id, u.email)) {
         if (mq.count.get(m.id).n >= MEETUP_MAX_MEMBERS) throw new HttpError(400, `This meetup is full (${MEETUP_MAX_MEMBERS} people)`);
         mq.join.run(m.id, u.email, now());
+        mq.uninvite.run(m.id, u.email);
         pushTo(m.host_email, { title: `🙌 ${u.name} joined ${m.name}`, body: `${mq.count.get(m.id).n} going`, url: meetupAppLink(m), tag: `mjoin-${m.token}` });
         count('meetup:joined');
       }
       return json(res, 200, { meetup: meetupView(m, u) }), true;
+    }
+    if (action === 'decline' && M === 'POST') {
+      mq.uninvite.run(m.id, u.email);
+      return json(res, 200, { ok: true }), true;
     }
     const me = requireMember(m, u);
 
@@ -1530,6 +1558,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (!v || v.email === u.email) { missing.push(n); continue; }
         if (mq.member.get(m.id, v.email)) { sent.push(n); continue; }
         sent.push(n);
+        mq.invite.run(m.id, v.email, now());
         pushTo(v.email, { title: `📍 ${u.name} invited you to ${m.name}`, body: `${meetupWhen(m)}${m.place_name ? ' · ' + m.place_name : ''}. Tap to join.`, url: meetupAppLink(m), tag: `minvite-${m.token}` })
           .then(nDev => { if (!nDev) inviteEmail(m, u, v.email); });
       }
