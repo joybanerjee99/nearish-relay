@@ -21,6 +21,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import webpush from 'web-push';
 import { previewSvg, previewText, renderPng } from './neerly-preview.mjs';
+import { sendApns, sendFcm, apnsConfigured, fcmConfigured } from './neerly-native-push.mjs'; // v1.0
 
 const SESSION_MS       = 30 * 24 * 60 * 60 * 1000; // 30 days
 const RESET_MS          = 15 * 60 * 1000;            // 15 minutes
@@ -94,6 +95,18 @@ const ETA_MAX_MIN        = 600;                  // a typed ETA can be up to 10 
 const PLACE_NAME_MAX     = 40;
 const INBOX_KEEP_MS      = 7 * 24 * 60 * 60 * 1000; // the in-app notifications list keeps a week
 const INBOX_MAX          = 100;
+// v0.9 — Meetups (free limits; Plus raises them later)
+const MEETUP_DURATIONS   = [30, 60, 90, 120];     // minutes from the start time (free: up to 2 hours)
+const MEETUP_MAX_MEMBERS = 8;
+const MEETUP_MAX_HOSTED  = 10;                    // open meetups one person can host at a time
+const MEETUP_OPEN_BEFORE_MS = 60 * 60 * 1000;     // "I'm on my way" opens an hour before the start
+const MEETUP_REMIND_MS   = 15 * 60 * 1000;        // reminder 15 min before the start
+const MEETUP_AHEAD_MS    = 14 * 24 * 60 * 60 * 1000; // plan up to 2 weeks ahead
+const MEETUP_KEEP_MS     = 24 * 60 * 60 * 1000;   // a meetup and its member list are deleted a day after it ends
+const MEETUP_NAME_MAX    = 40;
+const MEETUP_MSGS        = ['On my way 🏃', 'Running 10 min late', 'Parking now 🚗', 'Here! 👋', 'Save me a seat'];
+const MEETUP_MSG_GAP_MS  = 5000;
+const MEETUP_MSG_KEEP_MS = 30 * 60 * 1000;        // a quick message shows next to the name for 30 min
 
 export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // NEERLY_URL is where emailed links point: the page itself (…/neerly.html) or, from v0.7a, the
@@ -313,6 +326,51 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_shares', 'late_warned_at', 'INTEGER');
   addCol('neerly_shares', 'late_nudged_at', 'INTEGER');
   addCol('neerly_shares', 'eta_at', 'INTEGER');                      // v0.8: the sender's own ETA ("I'll be there in 18 min"), as a time
+  // v0.9: meetups, their members, and usage counts (numbers per day only)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS neerly_meetups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL UNIQUE,
+      host_email TEXT NOT NULL,
+      name TEXT NOT NULL,
+      place_lat REAL, place_lng REAL, place_name TEXT,
+      starts_at INTEGER NOT NULL,
+      ends_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      reminded INTEGER NOT NULL DEFAULT 0,
+      all_here_at INTEGER,
+      tz_offset INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS neerly_meetup_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      meetup_id INTEGER NOT NULL,
+      email TEXT NOT NULL,
+      joined_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'going',
+      share_id INTEGER,
+      arrived_at INTEGER,
+      msg TEXT, msg_at INTEGER,
+      UNIQUE (meetup_id, email)
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_mm_email ON neerly_meetup_members(email);
+    CREATE TABLE IF NOT EXISTS neerly_counters (
+      day TEXT NOT NULL,
+      key TEXT NOT NULL,
+      n INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, key)
+    );
+  `);
+  addCol('neerly_shares', 'meetup_id', 'INTEGER');
+  // v1.0: the native apps' notification tokens (APNs on iPhone, FCM on Android)
+  db.exec(`CREATE TABLE IF NOT EXISTS neerly_native_push (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_ok_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_native_email ON neerly_native_push(email);`);                   // v0.9: a member's share in a meetup
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
   console.log('[neerly] tables ready');
 
@@ -521,6 +579,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     purgeResets:   db.prepare('DELETE FROM neerly_reset_tokens WHERE expires_at < ? OR used = 1'),
   };
 
+  // v1.0: native app notification tokens
+  const nativeFor = db.prepare('SELECT * FROM neerly_native_push WHERE email = ? ORDER BY created_at');
+  const nativeUpsert = db.prepare('INSERT INTO neerly_native_push (token, email, platform, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET email = excluded.email, platform = excluded.platform, created_at = excluded.created_at');
+  const nativeDel = db.prepare('DELETE FROM neerly_native_push WHERE token = ?');
+  const nativeDelMine = db.prepare('DELETE FROM neerly_native_push WHERE token = ? AND email = ?');
+  const nativeOk = db.prepare('UPDATE neerly_native_push SET last_ok_at = ? WHERE token = ?');
+
   // Account deletion: everything tied to the user goes.
   const deleteAccount = db.transaction((email) => {
     const ids = db.prepare('SELECT id FROM neerly_shares WHERE sender_email = ?').all(email).map(r => r.id);
@@ -532,6 +597,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       anonViewers.delete(id); anonSeen.delete(id); reactLimits.delete(id);
     }
     db.prepare('DELETE FROM neerly_push_subs WHERE email = ?').run(email);
+    db.prepare('DELETE FROM neerly_native_push WHERE email = ?').run(email); // v1.0
     db.prepare('DELETE FROM neerly_presets WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_inbox WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_shares WHERE sender_email = ?').run(email);
@@ -542,6 +608,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     db.prepare('DELETE FROM neerly_verify_tokens WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_stats WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_badges WHERE email = ?').run(email);
+    deleteMeetupsOf(email);                                              // v0.9
     db.prepare('DELETE FROM neerly_share_backs WHERE from_email = ?').run(email);
     db.prepare('UPDATE neerly_users SET referred_by = NULL WHERE referred_by = ?').run(email);
     db.prepare('DELETE FROM neerly_users WHERE email = ?').run(email);
@@ -872,10 +939,19 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     // v0.8: everything sent as a notification also goes in the in-app list (not the "Send me a test" one).
     if (msg.tag !== 'test') { try { q.inboxAdd.run(email, String(msg.tag || '').split('-')[0] || null, msg.title, msg.body || '', msg.url || '', now()); } catch {} }
     const subs = q.pushSubsFor.all(email);
-    if (PUSH_LOG) { try { fs.appendFileSync(PUSH_LOG, JSON.stringify({ to: email, devices: subs.length, ...msg }) + '\n'); } catch {} }
-    if (!subs.length) return 0;
+    const natives = nativeFor.all(email); // v1.0: the iPhone and Android apps
+    if (PUSH_LOG) { try { fs.appendFileSync(PUSH_LOG, JSON.stringify({ to: email, devices: subs.length + natives.length, native: natives.length, ...msg }) + '\n'); } catch {} }
+    if (!subs.length && !natives.length) return 0;
     const payload = JSON.stringify({ title: msg.title, body: msg.body || '', url: msg.url || PAGE_URL, tag: msg.tag || undefined });
     let ok = 0;
+    await Promise.all(natives.map(async (d) => {
+      const send = d.platform === 'ios' ? (apnsConfigured() ? sendApns : null) : (fcmConfigured() ? sendFcm : null);
+      if (!send) return;
+      const r = await send(d.token, { ...msg, url: msg.url || PAGE_URL });
+      if (r.ok) { nativeOk.run(now(), d.token); ok++; }
+      else if (r.gone) { nativeDel.run(d.token); console.log(`[neerly:push] forgot a ${d.platform} app of ${email} (${r.reason || r.status})`); }
+      else console.warn(`[neerly:push] ${d.platform} send to ${email} failed:`, r.status || '', r.reason || '');
+    }));
     await Promise.all(subs.map(async (s) => {
       try {
         await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload, { TTL: msg.ttl ?? 3600, urgency: 'high' });
@@ -888,7 +964,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (ok) console.log(`[neerly:push] → ${email} | ${msg.title} (${ok} device${ok === 1 ? '' : 's'})`);
     return ok;
   }
-  const hasPush = (email) => q.pushSubsFor.all(email).length > 0;
+  const hasPush = (email) => q.pushSubsFor.all(email).length > 0 || nativeFor.all(email).length > 0;
   // The live link a recipient gets, for notifications that open a share.
   const viewLink = (share, r) => shareLink(share, r);
   // What the sender sees as a watcher's name: their own nickname for them, or the @username they picked.
@@ -953,6 +1029,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (d <= arriveRadius(share.accuracy)) {
       q.setArrived.run(t, share.id);
       finalizeShare(share, t);
+      if (share.meetup_id) meetupArrived(share, t); // v0.9
       const where = share.note ? ` at ${share.note}` : '';
       pushRecipients(share, { title: `🎉 ${share.sender_name} arrived${where}`, body: 'Their share has ended.', tag: `arrived-${share.token}` });
       console.log(`[neerly:arrive] ${share.sender_email} arrived (${Math.round(d)} m) ${share.token}`);
@@ -1118,8 +1195,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       reactions: live && Number.isFinite(rxAfter) ? q.reactionsSince.all(share.id, rxAfter).reverse().map(x => ({ id: x.id, emoji: x.emoji, name: x.from_name || 'Someone', at: x.at })) : [],
       ...(live ? trailSlice(share.id, trailFrom) : { trail: [], trailFrom: 0, trailCount: 0 }),
       summary: live ? null : shareSummary(share),
+      meetup: share.meetup_id ? meetupRef(share.meetup_id) : null, // v0.9
     };
   }
+  function meetupRef(id) { const mt = mq.byId.get(id); return mt ? { token: mt.token, name: mt.name, placeName: mt.place_name || '' } : null; }
   function durationsFor(mode) { return mode === 'now' ? NOW_DURATIONS : DURATIONS; }
   function durationError(mode) { return mode === 'now' ? 'Pick 30 min, 1 hour, 2 hours or 4 hours' : 'Pick 15 min, 30 min or 1 hour'; }
   function cleanNote(v) { return String(v ?? '').replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, NOTE_MAX);
@@ -1129,6 +1208,363 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     let share = q.shareByToken.get(token);
     if (!share || share.sender_email !== user.email) throw new HttpError(404, 'Share not found');
     return endIfExpired(share);
+  }
+
+  // ── v0.9 Meetups ────────────────────────────────────────────────────────────
+  // A meetup is a named get-together with an optional place, a start time and a hard end. Members join with an
+  // account. Nobody shares automatically: each member taps "I'm on my way", which starts an ordinary On my way share
+  // (meetup_id set, no recipients) that ends at the meetup's end, on arrival, or when they stop. Everyone in the
+  // meetup sees everyone's buddy on one map. A meetup and its member list are deleted a day after it ends.
+  const mq = {
+    insert:      db.prepare('INSERT INTO neerly_meetups (token, host_email, name, place_lat, place_lng, place_name, starts_at, ends_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    byToken:     db.prepare('SELECT * FROM neerly_meetups WHERE token = ?'),
+    byId:        db.prepare('SELECT * FROM neerly_meetups WHERE id = ?'),
+    hostedOpen:  db.prepare('SELECT COUNT(*) n FROM neerly_meetups WHERE host_email = ? AND ended_at IS NULL AND ends_at > ?'),
+    mine:        db.prepare(`SELECT m.*, mm.status my_status FROM neerly_meetup_members mm JOIN neerly_meetups m ON m.id = mm.meetup_id
+                             WHERE mm.email = ? ORDER BY (m.ended_at IS NOT NULL OR m.ends_at <= ?), m.starts_at`),
+    members:     db.prepare('SELECT * FROM neerly_meetup_members WHERE meetup_id = ? ORDER BY joined_at'),
+    member:      db.prepare('SELECT * FROM neerly_meetup_members WHERE meetup_id = ? AND email = ?'),
+    count:       db.prepare('SELECT COUNT(*) n FROM neerly_meetup_members WHERE meetup_id = ?'),
+    join:        db.prepare("INSERT OR IGNORE INTO neerly_meetup_members (meetup_id, email, joined_at, status) VALUES (?, ?, ?, 'going')"),
+    leave:       db.prepare('DELETE FROM neerly_meetup_members WHERE meetup_id = ? AND email = ?'),
+    setStatus:   db.prepare('UPDATE neerly_meetup_members SET status = ? WHERE id = ?'),
+    setShare:    db.prepare("UPDATE neerly_meetup_members SET share_id = ?, status = 'going' WHERE id = ?"),
+    setArrived:  db.prepare('UPDATE neerly_meetup_members SET arrived_at = ? WHERE meetup_id = ? AND email = ? AND arrived_at IS NULL'),
+    setMsg:      db.prepare('UPDATE neerly_meetup_members SET msg = ?, msg_at = ? WHERE id = ?'),
+    end:         db.prepare('UPDATE neerly_meetups SET ended_at = ? WHERE id = ? AND ended_at IS NULL'),
+    allHere:     db.prepare('UPDATE neerly_meetups SET all_here_at = ? WHERE id = ? AND all_here_at IS NULL'),
+    toRemind:    db.prepare('SELECT * FROM neerly_meetups WHERE reminded = 0 AND ended_at IS NULL AND starts_at - ? <= ? AND ends_at > ?'),
+    reminded:    db.prepare('UPDATE neerly_meetups SET reminded = 1 WHERE id = ?'),
+    toEnd:       db.prepare('SELECT * FROM neerly_meetups WHERE ended_at IS NULL AND ends_at <= ?'),
+    old:         db.prepare('SELECT id FROM neerly_meetups WHERE COALESCE(ended_at, ends_at) < ?'),
+    delMembers:  db.prepare('DELETE FROM neerly_meetup_members WHERE meetup_id = ?'),
+    del:         db.prepare('DELETE FROM neerly_meetups WHERE id = ?'),
+    openShares:  db.prepare('SELECT * FROM neerly_shares WHERE meetup_id = ? AND ended_at IS NULL'),
+    setMeetup:   db.prepare('UPDATE neerly_shares SET meetup_id = ? WHERE id = ?'),
+    membershipsOf: db.prepare('SELECT meetup_id FROM neerly_meetup_members WHERE email = ?'),
+    hostedBy:    db.prepare('SELECT id FROM neerly_meetups WHERE host_email = ?'),
+  };
+  const meetupLink = (m) => LINK_BASE ? `${LINK_BASE}/neerly/m/${m.token}` : `${PAGE_URL}?meetup=${m.token}`;
+  const meetupAppLink = (m) => `${PAGE_URL}?meetup=${m.token}`; // notifications open the page directly (same site as the app)
+  const meetupOpenAt = (m) => m.starts_at - MEETUP_OPEN_BEFORE_MS;
+  const meetupLive = (m) => !m.ended_at && m.ends_at > now();
+  function loadMeetup(token) {
+    const m = mq.byToken.get(token);
+    if (!m) throw new HttpError(404, 'This meetup doesn’t exist anymore');
+    return m;
+  }
+  function requireMember(m, u) {
+    const mm = mq.member.get(m.id, u.email);
+    if (!mm) throw new HttpError(403, 'Join this meetup first');
+    return mm;
+  }
+  // A member's share for this meetup (only while it runs).
+  function memberShare(mm) {
+    if (!mm.share_id) return null;
+    const s = q.shareById.get(mm.share_id);
+    return s ? endIfExpired(s) : null;
+  }
+  // Where each member is at: 'out' (can't make it), 'arrived', 'onway' (sharing now), 'going' (not started yet).
+  function memberState(mm, s) {
+    if (mm.status === 'out') return 'out';
+    if (mm.arrived_at) return 'arrived';
+    if (s && isActive(s)) return 'onway';
+    return 'going';
+  }
+  function meetupView(m, viewer) {
+    const t = now();
+    const host = q.userByEmail.get(m.host_email);
+    const rows = mq.members.all(m.id);
+    const isMember = !!viewer && rows.some(r => r.email === viewer.email);
+    const base = {
+      token: m.token, name: m.name, link: meetupLink(m),
+      place: m.place_lat != null ? { lat: m.place_lat, lng: m.place_lng, name: m.place_name || '' } : (m.place_name ? { name: m.place_name } : null),
+      startsAt: m.starts_at, endsAt: m.ends_at, endedAt: m.ended_at || (m.ends_at <= t ? m.ends_at : null),
+      openAt: meetupOpenAt(m), live: meetupLive(m), allHereAt: m.all_here_at || null,
+      hostName: host?.name || 'Someone', isHost: !!viewer && viewer.email === m.host_email, isMember,
+      maxMembers: MEETUP_MAX_MEMBERS, memberCount: rows.length, quickMessages: MEETUP_MSGS,
+    };
+    base.members = rows.map(r => {
+      const u = q.userByEmail.get(r.email);
+      const look = lookFor(u);
+      const out = { name: u?.name || 'Someone', username: u?.username || null, avatar: u?.avatar || null, outfit: look.outfit,
+        isHost: r.email === m.host_email, isMe: !!viewer && r.email === viewer.email };
+      if (!isMember) return out; // people who haven't joined see who's going, never where anyone is
+      const s = memberShare(r);
+      const live = s && isActive(s);
+      Object.assign(out, {
+        state: memberState(r, s), arrivedAt: r.arrived_at || null,
+        msg: r.msg && t - r.msg_at < MEETUP_MSG_KEEP_MS ? r.msg : null, msgAt: r.msg_at || null,
+        location: live && s.lat != null ? { lat: s.lat, lng: s.lng, accuracy: s.accuracy, at: s.loc_at } : null,
+        eta: live ? etaOf(s) : null, weather: live ? weatherOf(s) : null, shareToken: out.isMe && live ? s.token : null,
+      });
+      if (live) refreshWeather(s);
+      return out;
+    });
+    return base;
+  }
+  function meetupListItem(m, email) {
+    const rows = mq.members.all(m.id);
+    const me = rows.find(r => r.email === email);
+    const s = me ? memberShare(me) : null;
+    return { token: m.token, name: m.name, placeName: m.place_name || '', startsAt: m.starts_at, endsAt: m.ends_at,
+      endedAt: m.ended_at || (m.ends_at <= now() ? m.ends_at : null), live: meetupLive(m), memberCount: rows.length,
+      isHost: m.host_email === email, myState: me ? memberState(me, s) : null,
+      buddies: rows.slice(0, 6).map(r => { const u = q.userByEmail.get(r.email); return { avatar: u?.avatar || null, outfit: lookFor(u).outfit }; }) };
+  }
+  // Notify the other members (or everyone) of a meetup.
+  function pushMembers(m, exceptEmail, msg) {
+    for (const r of mq.members.all(m.id)) if (r.email !== exceptEmail && r.status !== 'out') pushTo(r.email, { ...msg, url: meetupAppLink(m), tag: msg.tag || `meetup-${m.token}` });
+  }
+  // Called when a member's meetup share reaches the place.
+  function meetupArrived(share, t) {
+    const m = mq.byId.get(share.meetup_id); if (!m) return;
+    mq.setArrived.run(t, m.id, share.sender_email);
+    const where = m.place_name ? ` at ${m.place_name}` : '';
+    pushMembers(m, share.sender_email, { title: `🎉 ${share.sender_name} arrived${where}`, body: m.name, tag: `marrive-${m.token}` });
+    const coming = mq.members.all(m.id).filter(r => r.status !== 'out');
+    if (coming.length > 1 && coming.every(r => r.arrived_at)) {
+      if (mq.allHere.run(t, m.id).changes) pushMembers(m, null, { title: '🎉 Everyone’s here!', body: m.name, tag: `mallhere-${m.token}` });
+    }
+    count('meetup:arrived');
+  }
+  function endMeetupShares(m, t) { for (const s of mq.openShares.all(m.id)) finalizeShare(s, t); }
+  function deleteMeetup(id) { db.transaction(() => { mq.delMembers.run(id); mq.del.run(id); })(); }
+  function meetupSweep(t) {
+    for (const m of mq.toRemind.all(MEETUP_REMIND_MS, t, t)) {
+      mq.reminded.run(m.id);
+      for (const r of mq.members.all(m.id)) {
+        if (r.status === 'out' || r.arrived_at || (r.share_id && isActive(q.shareById.get(r.share_id) || { ended_at: 1 }))) continue;
+        pushTo(r.email, { title: `⏰ ${m.name} starts soon`, body: 'Tap “I’m on my way” when you leave, so everyone can see you coming.', url: meetupAppLink(m), tag: `mremind-${m.token}` });
+      }
+    }
+    for (const m of mq.toEnd.all(t)) { mq.end.run(m.ends_at, m.id); endMeetupShares(m, m.ends_at); }
+    for (const { id } of mq.old.all(t - MEETUP_KEEP_MS)) deleteMeetup(id);
+  }
+  // Account deletion: leave every meetup, and hosted meetups go entirely.
+  function deleteMeetupsOf(email) {
+    for (const { id } of mq.hostedBy.all(email)) { const m = mq.byId.get(id); if (m) endMeetupShares(m, now()); deleteMeetup(id); }
+    for (const { meetup_id } of mq.membershipsOf.all(email)) mq.leave.run(meetup_id, email);
+  }
+  function inviteEmail(m, inviter, to) {
+    const when = meetupWhen(m);
+    const html = emailShell(`
+      <p style="font-size:20px;font-weight:600;margin:0 0 8px">${esc(inviter.name)} invited you to ${esc(m.name)} 🧡</p>
+      <p style="color:#6b5a50;margin:0 0 24px">${esc(when)}${m.place_name ? ` · ${esc(m.place_name)}` : ''}. Join to see everyone’s buddy on one map as they head over. Sharing only starts when you tap “I’m on my way”, and it ends on its own.</p>
+      ${button(meetupLink(m), 'See the meetup →')}`);
+    return sendEmail(to, `${inviter.name} invited you to ${m.name}`, html, meetupLink(m));
+  }
+  // A plain date for emails (the server doesn't know the reader's time zone, so it uses UTC offset from the creator).
+  function meetupWhen(m) {
+    try {
+      const d = new Date(m.starts_at - (m.tz_offset || 0) * 60000);
+      return d.toUTCString().replace(/:\d\d GMT$/, '').replace(/^(\w+), (\d+) (\w+) \d{4} /, '$1 $3 $2, ');
+    } catch { return ''; }
+  }
+
+  // ── Usage counts (v0.9): numbers per day, never who or where ───────────────────
+  const cq = { inc: db.prepare('INSERT INTO neerly_counters (day, key, n) VALUES (?, ?, 1) ON CONFLICT(day, key) DO UPDATE SET n = n + 1'),
+    since: db.prepare('SELECT day, key, n FROM neerly_counters WHERE day >= ? ORDER BY day, key') };
+  function count(key) { try { cq.inc.run(new Date(now()).toISOString().slice(0, 10), String(key).slice(0, 60)); } catch {} }
+
+  async function meetupRoute(req, res, url, p, M) {
+    // The link preview for an invite ("Joy invited you to Dinner"), like /neerly/p/ for shares.
+    const pv = p.match(/^\/neerly\/m\/([A-Za-z0-9_-]{8,64})(\.png)?$/);
+    if (pv && M === 'GET') {
+      const m = mq.byToken.get(pv[1]);
+      if (!m) { res.writeHead(302, { Location: PAGE_URL }); res.end(); return true; }
+      const host = q.userByEmail.get(m.host_email);
+      const info = { kind: 'meetup', senderName: host?.name || 'A friend', note: m.name, placeName: m.place_name || '', active: meetupLive(m),
+        senderAvatar: host?.avatar || null, senderOutfit: lookFor(host).outfit };
+      if (pv[2]) {
+        const key = JSON.stringify(info);
+        let hit = previewCache.get('m:' + m.token);
+        if (!hit || hit.key !== key) { hit = { key, png: renderPng(previewSvg(info)) }; previewCache.set('m:' + m.token, hit); }
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=300' });
+        res.end(hit.png);
+        return true;
+      }
+      const dest = `${PAGE_URL}?meetup=${m.token}`;
+      const { title, sub } = previewText(info);
+      const img = `${LINK_BASE || ''}/neerly/m/${m.token}.png`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)} · Neerly</title>
+<meta property="og:title" content="${esc(title)}"><meta property="og:description" content="${esc(sub)}">
+<meta property="og:image" content="${esc(img)}"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
+<meta property="og:type" content="website"><meta property="og:site_name" content="Neerly"><meta name="twitter:card" content="summary_large_image">
+<meta http-equiv="refresh" content="0;url=${esc(dest)}"><script>location.replace(${JSON.stringify(dest)});</script>
+</head><body><p><a href="${esc(dest)}">Open Neerly</a></p></body></html>`);
+      return true;
+    }
+
+    // Usage counts for Joy (numbers only). Needs NEERLY_ADMIN_KEY.
+    if (p === '/neerly/admin/counts' && M === 'GET') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      const days = Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 30));
+      const rows = cq.since.all(new Date(now() - days * 86400000).toISOString().slice(0, 10));
+      const totals = {};
+      for (const r of rows) totals[r.key] = (totals[r.key] || 0) + r.n;
+      return json(res, 200, { days, totals, rows }), true;
+    }
+
+    if (p === '/neerly/meetups' && M === 'GET') {
+      const u = requireUser(req);
+      const t = now();
+      const list = mq.mine.all(u.email, t).filter(m => !m.ended_at || t - m.ended_at < MEETUP_KEEP_MS).map(m => meetupListItem(m, u.email));
+      return json(res, 200, { meetups: list }), true;
+    }
+
+    if (p === '/neerly/meetups' && M === 'POST') {
+      const u = requireUser(req);
+      const b = await readBody(req);
+      const name = cleanNote(b.name).slice(0, MEETUP_NAME_MAX);
+      if (!name) throw new HttpError(400, 'Give your meetup a name, like “Dinner” or “Concert”');
+      const place = b.place ? parseDest({ dest: b.place }) : null;
+      if (b.place && !place) throw new HttpError(400, 'That place pin doesn’t look right');
+      const t = now();
+      const startsAt = Number(b.startsAt);
+      if (!Number.isFinite(startsAt) || startsAt < t - 5 * 60000) throw new HttpError(400, 'Pick a start time that hasn’t passed');
+      if (startsAt > t + MEETUP_AHEAD_MS) throw new HttpError(400, 'Meetups can be planned up to 2 weeks ahead');
+      const minutes = Number(b.minutes);
+      if (!MEETUP_DURATIONS.includes(minutes)) throw new HttpError(400, `Meetups last 30 min to ${MEETUP_DURATIONS.at(-1) / 60} hours`);
+      if (mq.hostedOpen.get(u.email, t).n >= MEETUP_MAX_HOSTED) throw new HttpError(400, `You can host up to ${MEETUP_MAX_HOSTED} meetups at a time`);
+      const token = randToken(12);
+      const start = Math.max(startsAt, t);
+      const tz = Number.isFinite(Number(b.tzOffset)) && Math.abs(Number(b.tzOffset)) <= 14 * 60 ? Number(b.tzOffset) : 0;
+      db.transaction(() => {
+        const info = mq.insert.run(token, u.email, name, place?.lat ?? null, place?.lng ?? null, place?.name || null, start, start + minutes * 60000, t);
+        db.prepare('UPDATE neerly_meetups SET tz_offset = ? WHERE id = ?').run(tz, info.lastInsertRowid);
+        mq.join.run(info.lastInsertRowid, u.email, t);
+        if (start - t <= MEETUP_REMIND_MS) mq.reminded.run(info.lastInsertRowid);
+      })();
+      count('meetup:created');
+      console.log(`[neerly:meetup] ${u.email} created ${token} (${minutes} min)`);
+      return json(res, 200, { meetup: meetupView(mq.byToken.get(token), u) }), true;
+    }
+
+    const mm = p.match(/^\/neerly\/meetups\/([A-Za-z0-9_-]{8,64})(?:\/([a-z-]+))?$/);
+    if (!mm) return false;
+    const [, token, action] = mm;
+    const m0 = loadMeetup(token);
+    // Past its end: mark it ended (the sweep does this too) so every view agrees.
+    if (!m0.ended_at && m0.ends_at <= now()) { mq.end.run(m0.ends_at, m0.id); endMeetupShares(m0, m0.ends_at); }
+    const m = mq.byId.get(m0.id);
+
+    if (!action && M === 'GET') return json(res, 200, { meetup: meetupView(m, authUser(req)) }), true;
+
+    const u = requireUser(req);
+    if (action === 'join' && M === 'POST') {
+      if (!meetupLive(m)) throw new HttpError(410, 'This meetup has ended');
+      if (!mq.member.get(m.id, u.email)) {
+        if (mq.count.get(m.id).n >= MEETUP_MAX_MEMBERS) throw new HttpError(400, `This meetup is full (${MEETUP_MAX_MEMBERS} people)`);
+        mq.join.run(m.id, u.email, now());
+        pushTo(m.host_email, { title: `🙌 ${u.name} joined ${m.name}`, body: `${mq.count.get(m.id).n} going`, url: meetupAppLink(m), tag: `mjoin-${m.token}` });
+        count('meetup:joined');
+      }
+      return json(res, 200, { meetup: meetupView(m, u) }), true;
+    }
+    const me = requireMember(m, u);
+
+    if (action === 'go' && M === 'POST') {
+      if (!meetupLive(m)) throw new HttpError(410, 'This meetup has ended');
+      const t = now();
+      if (t < meetupOpenAt(m)) throw new HttpError(400, 'You can start sharing from an hour before the meetup');
+      const { lat, lng, accuracy, tzOffset } = await readBody(req);
+      if (!validCoord(lat, lng)) throw new HttpError(400, 'We couldn’t get your location');
+      const cur = memberShare(me);
+      if (cur && isActive(cur)) return json(res, 200, { share: senderView(cur), meetup: meetupView(m, u) }), true;
+      const stoken = randToken(18);
+      const note = m.place_name || m.name;
+      for (const old of q.openSharesFor.all(u.email)) finalizeShare(old, t); // one live share at a time
+      const created = db.transaction(() => {
+        const info = q.insertShare.run(stoken, u.email, u.name, t, m.ends_at, Number(lat), Number(lng), numOrNull(accuracy), t, 'way', note, 1);
+        addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
+        if (m.place_lat != null) q.setDest.run(m.place_lat, m.place_lng, note, info.lastInsertRowid);
+        mq.setMeetup.run(m.id, info.lastInsertRowid);
+        mq.setShare.run(info.lastInsertRowid, me.id);
+        countShareStart(u.email, t, Number(tzOffset));
+        return q.shareByToken.get(stoken);
+      })();
+      checkBadges(u.email);
+      refreshWeather(created);
+      pushMembers(m, u.email, { title: `👣 ${u.name} is on the way`, body: `${m.name}${m.place_name ? ' · ' + m.place_name : ''}`, tag: `mgo-${m.token}-${u.username || ''}` });
+      count('meetup:go');
+      console.log(`[neerly:meetup] ${u.email} is on the way to ${m.token}`);
+      // Already there? (They tapped it at the place.)
+      const fresh = afterMove(created, null, t);
+      return json(res, 200, { share: senderView(fresh), meetup: meetupView(mq.byId.get(m.id), u) }), true;
+    }
+
+    if (action === 'status' && M === 'POST') {
+      const { status } = await readBody(req);
+      if (!['out', 'going'].includes(status)) throw new HttpError(400, 'Unknown status');
+      if (status === 'out') {
+        const s = memberShare(me); if (s && isActive(s)) finalizeShare(s, now());
+        if (me.status !== 'out') pushMembers(m, u.email, { title: `😕 ${u.name} can’t make it`, body: m.name, tag: `mout-${m.token}` });
+      }
+      mq.setStatus.run(status, me.id);
+      return json(res, 200, { meetup: meetupView(mq.byId.get(m.id), u) }), true;
+    }
+
+    if (action === 'say' && M === 'POST') {
+      const { msg } = await readBody(req);
+      if (!MEETUP_MSGS.includes(msg)) throw new HttpError(400, 'Pick one of the quick messages');
+      const t = now();
+      if (me.msg_at && t - me.msg_at < MEETUP_MSG_GAP_MS) return json(res, 429, { error: 'Give it a few seconds' }), true;
+      mq.setMsg.run(msg, t, me.id);
+      pushMembers(m, u.email, { title: `💬 ${u.name}: ${msg}`, body: m.name, tag: `msay-${m.token}`, ttl: 1800 });
+      count('meetup:say');
+      return json(res, 200, { meetup: meetupView(mq.byId.get(m.id), u) }), true;
+    }
+
+    if (action === 'invite' && M === 'POST') {
+      if (!meetupLive(m)) throw new HttpError(410, 'This meetup has ended');
+      const { usernames } = await readBody(req);
+      const names = [...new Set((Array.isArray(usernames) ? usernames : []).map(normUsername).filter(Boolean))].slice(0, MEETUP_MAX_MEMBERS);
+      if (!names.length) throw new HttpError(400, 'Add someone’s @username');
+      const sent = [], missing = [];
+      for (const n of names) {
+        const v = q.userByUsername.get(n);
+        if (!v || v.email === u.email) { missing.push(n); continue; }
+        if (mq.member.get(m.id, v.email)) { sent.push(n); continue; }
+        sent.push(n);
+        pushTo(v.email, { title: `📍 ${u.name} invited you to ${m.name}`, body: `${meetupWhen(m)}${m.place_name ? ' · ' + m.place_name : ''}. Tap to join.`, url: meetupAppLink(m), tag: `minvite-${m.token}` })
+          .then(nDev => { if (!nDev) inviteEmail(m, u, v.email); });
+      }
+      count('meetup:invite');
+      return json(res, 200, { sent, missing }), true;
+    }
+
+    if (action === 'leave' && M === 'POST') {
+      if (m.host_email === u.email) throw new HttpError(400, 'You’re the host: end the meetup instead');
+      const s = memberShare(me); if (s && isActive(s)) finalizeShare(s, now());
+      mq.leave.run(m.id, u.email);
+      return json(res, 200, { ok: true }), true;
+    }
+
+    if (action === 'end' && M === 'POST') {
+      if (m.host_email !== u.email) throw new HttpError(403, 'Only the host can end the meetup');
+      const t = now();
+      if (mq.end.run(t, m.id).changes) {
+        endMeetupShares(m, t);
+        pushMembers(m, u.email, { title: `👋 ${m.name} has ended`, body: 'Everyone’s sharing has stopped.', tag: `mend-${m.token}` });
+      }
+      return json(res, 200, { meetup: meetupView(mq.byId.get(m.id), u) }), true;
+    }
+
+    if (action === 'remove' && M === 'POST') {
+      if (m.host_email !== u.email) throw new HttpError(403, 'Only the host can remove people');
+      const { username } = await readBody(req);
+      const v = q.userByUsername.get(normUsername(username));
+      if (!v || v.email === u.email) throw new HttpError(400, 'Pick someone in the meetup');
+      const r = mq.member.get(m.id, v.email);
+      if (r) { const s = memberShare(r); if (s && isActive(s)) finalizeShare(s, now()); mq.leave.run(m.id, v.email); }
+      return json(res, 200, { meetup: meetupView(mq.byId.get(m.id), u) }), true;
+    }
+
+    throw new HttpError(404, 'Not found');
   }
 
   // ── Router ────────────────────────────────────────────────────────────────
@@ -1160,6 +1596,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       q.insertUser.run(e, n, hashPassword(password, salt), salt, now(), now(), un, av, referrer);
       q.ensureStats.run(e);
       if (referrer) checkBadges(referrer);
+      count('signup'); if (av) count('buddy:' + av); if (referrer) count('signup:from-link');
       console.log(`[neerly:auth] signup ${e} @${un}`);
       return json(res, 200, { token: newSession(e), user: publicUser(q.userByEmail.get(e)) });
     }
@@ -1294,6 +1731,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       if (!un.trail.includes(trail)) throw new HttpError(400, 'That trail isn’t unlocked yet');
       const icon = body.appIcon !== undefined ? body.appIcon : (u.app_icon || 'classic');
       if (!un.icon.includes(icon)) throw new HttpError(400, 'That icon isn’t unlocked yet');
+      for (const slot of OUTFIT_SLOTS) if (outfit[slot] && outfit[slot] !== cur[slot]) count(`outfit:${outfit[slot]}`);
+      if (trail !== (u.trail_style || DEFAULT_TRAIL)) count('trail:' + trail);
       q.setLook.run(JSON.stringify(outfit), trail, icon, u.email);
       return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
     }
@@ -1334,6 +1773,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (!AVATARS.includes(body.avatar)) throw new HttpError(400, 'Pick one of the buddies');
         av = body.avatar;
       }
+      if (av !== u.avatar) count('buddy:' + av);
       q.setProfile.run(n, un, av, u.email);
       return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
     }
@@ -1429,7 +1869,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     // Turn notifications on for this device. A device belongs to one account at a time.
     if (p === '/neerly/me/push' && M === 'POST') {
       const u = requireUser(req);
-      const { subscription } = await readBody(req);
+      const { subscription, native } = await readBody(req);
+      // v1.0: the native app sends its APNs / FCM token instead of a web push subscription.
+      if (native) {
+        const platform = String(native.platform || ''), token = String(native.token || '');
+        if (!['ios', 'android'].includes(platform) || !/^[A-Za-z0-9:_.-]{20,400}$/.test(token)) throw new HttpError(400, 'That notification setup didn’t work. Try again.');
+        nativeUpsert.run(token, u.email, platform, now());
+        const mine = nativeFor.all(u.email);
+        for (const d of mine.slice(0, Math.max(0, mine.length - MAX_PUSH_SUBS))) nativeDel.run(d.token);
+        console.log(`[neerly:push] ${u.email} turned notifications on in the ${platform} app`);
+        return json(res, 200, { ok: true, devices: Math.min(mine.length, MAX_PUSH_SUBS) });
+      }
       const ep = String(subscription?.endpoint || ''), k = subscription?.keys || {};
       let host = '';
       try { const pu = new URL(ep); host = pu.protocol === 'https:' ? pu.hostname : ''; } catch {}
@@ -1444,8 +1894,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     }
     if (p === '/neerly/me/push/delete' && M === 'POST') {
       const u = requireUser(req);
-      const { endpoint } = await readBody(req);
-      q.delPushSubMine.run(String(endpoint || ''), u.email);
+      const { endpoint, native } = await readBody(req);
+      if (native) nativeDelMine.run(String(native), u.email); // v1.0
+      else q.delPushSubMine.run(String(endpoint || ''), u.email);
       return json(res, 200, { ok: true });
     }
     // A test notification, so people can see it works (from the Profile screen).
@@ -1593,6 +2044,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       })();
       const newBadges = checkBadges(u.email);
       refreshWeather(created);
+      count('share:' + mode); if (dest) count('share:dest'); if (late) count('share:late'); if (original) count('share:back');
 
       // Email in the background so the sender's screen isn't waiting on Resend.
       // v0.7b: people with Neerly also get a notification. Someone picked by @username gets the
@@ -1600,6 +2052,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       for (const r of q.recipients.all(created.id)) deliverShare(created, r, !!r.hidden && !!original);
       console.log(`[neerly:share] ${u.email} started ${minutes}m ${mode}${showLoc ? '' : ' (no location)'} share ${token} → ${rs.length} recipient(s)${original ? ' (share back)' : ''}`);
       return json(res, 200, { share: senderView(created), newBadges, shareBackTo: original ? original.sender_name : null });
+    }
+
+    // ---- v0.9: meetups, invite previews, usage counts ----
+    if (p.startsWith('/neerly/meetups') || p.startsWith('/neerly/m/') || p.startsWith('/neerly/admin/')) {
+      if (await meetupRoute(req, res, url, p, M)) return;
     }
 
     // ---- Share sub-routes ----
@@ -1898,6 +2355,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     q.purgeVerify.run(t);
     checkLate(t);                             // v0.8
     checkNearByEta(t);
+    meetupSweep(t);                           // v0.9
     q.inboxPurge.run(t - INBOX_KEEP_MS);      // v0.8: the notifications list keeps a week
     for (const [shareId] of reactLimits) if (!q.shareById.get(shareId) || q.shareById.get(shareId).ended_at) reactLimits.delete(shareId);
     for (const [shareId, viewers] of anonViewers) {

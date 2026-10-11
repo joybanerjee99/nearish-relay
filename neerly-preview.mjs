@@ -35,6 +35,11 @@ function wrap(text, size, maxWidth, maxLines) {
 // What the card says, from the share. Used for the image and for the preview page's title.
 export function previewText(s) {
   const name = s.senderName || 'A friend';
+  // v0.9: a meetup invite
+  if (s.kind === 'meetup') {
+    if (!s.active) return { title: `${s.note} has ended`, sub: 'Neerly meetups end on their own.' };
+    return { title: `${name} invited you to ${s.note}`, sub: s.placeName ? `At ${s.placeName} · tap to join` : 'Tap to join on Neerly' };
+  }
   if (!s.active) return { title: `${name}’s share has ended`, sub: 'Neerly shares end on their own. Ask them for a new link.' };
   if (s.mode === 'now') {
     return s.note
