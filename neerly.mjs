@@ -22,6 +22,7 @@ import fs from 'fs';
 import webpush from 'web-push';
 import { previewSvg, previewText, renderPng } from './neerly-preview.mjs';
 import { sendApns, sendFcm, apnsConfigured, fcmConfigured } from './neerly-native-push.mjs'; // v1.0
+import { DASHBOARD_HTML } from './neerly-dashboard.mjs'; // v1.0: Joy's private usage dashboard
 
 const SESSION_MS       = 30 * 24 * 60 * 60 * 1000; // 30 days
 const RESET_MS          = 15 * 60 * 1000;            // 15 minutes
@@ -1379,8 +1380,33 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
   // ── Usage counts (v0.9): numbers per day, never who or where ───────────────────
   const cq = { inc: db.prepare('INSERT INTO neerly_counters (day, key, n) VALUES (?, ?, 1) ON CONFLICT(day, key) DO UPDATE SET n = n + 1'),
-    since: db.prepare('SELECT day, key, n FROM neerly_counters WHERE day >= ? ORDER BY day, key') };
-  function count(key) { try { cq.inc.run(new Date(now()).toISOString().slice(0, 10), String(key).slice(0, 60)); } catch {} }
+    since: db.prepare('SELECT day, key, n FROM neerly_counters WHERE day >= ? ORDER BY day, key'),
+    set: db.prepare('INSERT INTO neerly_counters (day, key, n) VALUES (?, ?, ?) ON CONFLICT(day, key) DO UPDATE SET n = excluded.n'),
+    activeSince: db.prepare('SELECT COUNT(*) n FROM neerly_users WHERE last_seen >= ?'),
+    users: db.prepare('SELECT COUNT(*) n FROM neerly_users') };
+  const today = () => new Date(now()).toISOString().slice(0, 10);
+  function count(key) { try { cq.inc.run(today(), String(key).slice(0, 60)); } catch {} }
+  // v1.0: where a request comes from (the page says): the website, the Home Screen web app, or the iPhone / Android app.
+  const CLIENTS = ['web', 'pwa', 'ios', 'android'];
+  const clientOf = (v) => (CLIENTS.includes(String(v)) ? String(v) : 'web');
+  // Snapshots (numbers only): active accounts in the last day, week and month, and all accounts. Kept per day ("snap:" keys).
+  let lastSnapAt = 0;
+  function snapshot(t, force) {
+    if (!force && t - lastSnapAt < 10 * 60 * 1000) return; // at most every 10 minutes (and whenever the dashboard asks)
+    lastSnapAt = t;
+    try {
+      const d = today();
+      cq.set.run(d, 'snap:active:1d', cq.activeSince.get(t - 86400000).n);
+      cq.set.run(d, 'snap:active:7d', cq.activeSince.get(t - 7 * 86400000).n);
+      cq.set.run(d, 'snap:active:30d', cq.activeSince.get(t - 30 * 86400000).n);
+      cq.set.run(d, 'snap:users', cq.users.get().n);
+    } catch {}
+  }
+  // Events the page reports itself (only these names; numbers only).
+  const PAGE_EVENTS = new Set(['postcard:made', 'postcard:shared', 'quickstart:used', 'repeat:used', 'share:sheet', 'share:copy', 'invite:sheet', 'invite:copy', 'how:view', 'how:getstarted', 'promo:tap']);
+  const eventLimits = new Map(); // ip -> { n, at }
+  // v1.0: marketing content that can change without an app update (a promo line on the share screen, etc.).
+  const contentGet = () => { try { return JSON.parse(metaGet('content') || '{}'); } catch { return {}; } };
 
   async function meetupRoute(req, res, url, p, M) {
     // The link preview for an invite ("Joy invited you to Dinner"), like /neerly/p/ for shares.
@@ -1414,6 +1440,47 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     }
 
     // Usage counts for Joy (numbers only). Needs NEERLY_ADMIN_KEY.
+    // v1.0: events the page reports (postcards, the share sheet, quick starts, campaign landings), numbers only.
+    if (p === '/neerly/event' && M === 'POST') {
+      const ip = String(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+      const lim = eventLimits.get(ip) || { n: 0, at: now() };
+      if (now() - lim.at > 60000) { lim.n = 0; lim.at = now(); }
+      lim.n++; eventLimits.set(ip, lim);
+      if (eventLimits.size > 5000) eventLimits.clear();
+      if (lim.n > 60) return json(res, 429, { error: 'Slow down' }), true;
+      const { k, c, client } = await readBody(req);
+      const cl = clientOf(client);
+      if (PAGE_EVENTS.has(k)) count(k), count(`${k}@${cl}`);
+      if (typeof c === 'string' && /^[a-z0-9_-]{1,32}$/i.test(c)) count('landing:' + c.toLowerCase()); // a campaign link (?c=…)
+      return json(res, 200, { ok: true }), true;
+    }
+    // v1.0: marketing content (public; the page shows it). Edited from the dashboard.
+    if (p === '/neerly/content' && M === 'GET') {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return json(res, 200, contentGet()), true;
+    }
+    if (p === '/neerly/admin/content' && M === 'POST') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      const b = await readBody(req);
+      const promo = b.promo && typeof b.promo === 'object' ? {
+        text: String(b.promo.text || '').replace(/[<>]/g, '').slice(0, 120),
+        link: /^https:\/\//.test(String(b.promo.link || '')) ? String(b.promo.link).slice(0, 300) : '',
+        until: Number(b.promo.until) || null,
+        where: (Array.isArray(b.promo.where) ? b.promo.where : ['share']).filter(w => ['share', 'watch', 'meetups', 'watcher'].includes(w)),
+        id: String(b.promo.id || Date.now()).slice(0, 40),
+      } : null;
+      const content = { promo: promo && promo.text ? promo : null, updatedAt: now() };
+      metaSet('content', JSON.stringify(content));
+      return json(res, 200, content), true;
+    }
+    if (p === '/neerly/admin' && M === 'GET') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+      res.end(DASHBOARD_HTML);
+      return true;
+    }
     if (p === '/neerly/admin/counts' && M === 'GET') {
       const key = process.env.NEERLY_ADMIN_KEY;
       if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
@@ -1421,7 +1488,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const rows = cq.since.all(new Date(now() - days * 86400000).toISOString().slice(0, 10));
       const totals = {};
       for (const r of rows) totals[r.key] = (totals[r.key] || 0) + r.n;
-      return json(res, 200, { days, totals, rows }), true;
+      snapshot(now(), true);
+      const rows2 = cq.since.all(new Date(now() - days * 86400000).toISOString().slice(0, 10));
+      return json(res, 200, { days, totals, rows: rows2, content: contentGet() }), true;
     }
 
     if (p === '/neerly/meetups' && M === 'GET') {
@@ -1603,7 +1672,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
     // ---- Auth ----
     if (p === '/neerly/auth/signup' && M === 'POST') {
-      const { name, email, password, username, avatar, ref } = await readBody(req);
+      const { name, email, password, username, avatar, ref, client, source } = await readBody(req);
       const e = norm(email), n = clean(name, 40);
       if (!n) throw new HttpError(400, 'Please add your name');
       if (!isEmail(e)) throw new HttpError(400, 'That email doesn’t look right');
@@ -1626,6 +1695,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       q.ensureStats.run(e);
       if (referrer) checkBadges(referrer);
       count('signup'); if (av) count('buddy:' + av); if (referrer) count('signup:from-link');
+      count('signup@' + clientOf(client)); // v1.0: website, Home Screen app, iPhone app or Android app
+      if (typeof source === 'string' && /^[a-z0-9:_-]{1,40}$/i.test(source)) count('source:' + source.toLowerCase());
       console.log(`[neerly:auth] signup ${e} @${un}`);
       return json(res, 200, { token: newSession(e), user: publicUser(q.userByEmail.get(e)) });
     }
@@ -1676,6 +1747,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const u = requireUser(req);
       const active = q.activeShareFor.get(u.email, now());
       checkBadges(u.email); // catches badges earned while offline (e.g. watched counts, friends joining)
+      count('open@' + clientOf(url.searchParams.get('c'))); // v1.0: app opens by platform
       return json(res, 200, { user: publicUser(u), stats: statsFor(u.email), badges: badgeView(u.email), unlocked: unlockedFor(u.email), activeShare: active ? senderView(active) : null });
     }
 
@@ -1904,6 +1976,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const platform = String(native.platform || ''), token = String(native.token || '');
         if (!['ios', 'android'].includes(platform) || !/^[A-Za-z0-9:_.-]{20,400}$/.test(token)) throw new HttpError(400, 'That notification setup didn’t work. Try again.');
         nativeUpsert.run(token, u.email, platform, now());
+        count('push:on@' + platform);
         const mine = nativeFor.all(u.email);
         for (const d of mine.slice(0, Math.max(0, mine.length - MAX_PUSH_SUBS))) nativeDel.run(d.token);
         console.log(`[neerly:push] ${u.email} turned notifications on in the ${platform} app`);
@@ -1916,6 +1989,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         throw new HttpError(400, 'That notification setup didn’t work. Try again.');
       }
       q.upsertPushSub.run(u.email, ep, k.p256dh, k.auth, now());
+      count('push:on@web');
       const subs = q.pushSubsFor.all(u.email);
       for (const s of subs.slice(0, Math.max(0, subs.length - MAX_PUSH_SUBS))) q.delPushSub.run(s.endpoint); // oldest devices go first
       console.log(`[neerly:push] ${u.email} turned notifications on (${Math.min(subs.length, MAX_PUSH_SUBS)} device(s))`);
@@ -2084,7 +2158,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     }
 
     // ---- v0.9: meetups, invite previews, usage counts ----
-    if (p.startsWith('/neerly/meetups') || p.startsWith('/neerly/m/') || p.startsWith('/neerly/admin/')) {
+    if (p.startsWith('/neerly/meetups') || p.startsWith('/neerly/m/') || p.startsWith('/neerly/admin') || p === '/neerly/event' || p === '/neerly/content') {
       if (await meetupRoute(req, res, url, p, M)) return;
     }
 
@@ -2385,6 +2459,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     checkLate(t);                             // v0.8
     checkNearByEta(t);
     meetupSweep(t);                           // v0.9
+    snapshot(t);                              // v1.0: active accounts (numbers only)
     q.inboxPurge.run(t - INBOX_KEEP_MS);      // v0.8: the notifications list keeps a week
     for (const [shareId] of reactLimits) if (!q.shareById.get(shareId) || q.shareById.get(shareId).ended_at) reactLimits.delete(shareId);
     for (const [shareId, viewers] of anonViewers) {
