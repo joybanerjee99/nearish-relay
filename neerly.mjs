@@ -23,6 +23,7 @@ import webpush from 'web-push';
 import { previewSvg, previewText, renderPng } from './neerly-preview.mjs';
 import { sendApns, sendFcm, apnsConfigured, fcmConfigured } from './neerly-native-push.mjs'; // v1.0
 import { DASHBOARD_HTML } from './neerly-dashboard.mjs'; // v1.0: Joy's private usage dashboard
+import { BUDDIES } from './neerly-buddies.mjs';
 
 const SESSION_MS       = 30 * 24 * 60 * 60 * 1000; // 30 days
 const RESET_MS          = 15 * 60 * 1000;            // 15 minutes
@@ -888,6 +889,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return m >= 60 && m % 60 === 0 ? `${m / 60} hour${m === 60 ? '' : 's'}` : m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
 
+  const buddyKind = (email) => (BUDDIES[q.userByEmail.get(email)?.avatar]?.name || 'Fox').toLowerCase(); // v1.0: "the little fox"
   function shareEmail(share, recipient, isShareBack) {
     const link = shareLink(share, recipient);
     const t = shareTitle(share, isShareBack);
@@ -896,6 +898,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       <p style="color:#6b5a50;margin:0 0 24px">${share.mode === 'now'
         ? `Live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to see${share.show_loc ? ' where they are' : ''}. No app or account needed.`
         : `Sharing live for the next ${durationLabel(share.expires_at - share.started_at)} — tap to watch. No app or account needed.`}</p>
+      ${share.show_loc ? `<p style="color:#6b5a50;margin:-12px 0 24px">On the map, ${esc(share.sender_name)} is the little ${esc(buddyKind(share.sender_email))}: their Neerly buddy, a character that stands for them and walks their route.</p>` : ''}
       ${button(link, share.mode === 'now' ? 'See it live →' : 'Watch live →')}`);
     const subject = t;
     return sendEmail(recipient.email, subject, html, link);
