@@ -644,7 +644,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   function usernameBase(s) {
     let b = String(s || '').toLowerCase().replace(/\+.*$/, '').replace(/[^a-z0-9._]/g, '')
       .replace(/[._]{2,}/g, '.').replace(/^[._]+|[._]+$/g, '').slice(0, 16).replace(/[._]+$/, '');
-    if (b.length < 3) b = (b + 'buddy').slice(0, 16);
+    if (b.length < 3) b = b + crypto.randomInt(100, 1000); // short names get digits (not "buddy", which is the map character)
     if (RESERVED_USERNAMES.has(b)) b += '1';
     return b;
   }
@@ -655,7 +655,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const cand = i === 1 ? base : i < 20 ? `${base}${i}` : `${base.slice(0, 14)}${crypto.randomInt(100, 1000)}`;
       if (!usernameProblem(cand) && !usernameTaken(cand, exceptEmail)) return cand;
     }
-    return `buddy${crypto.randomInt(100000, 1000000)}`;
+    return `neerly${crypto.randomInt(100000, 1000000)}`;
   }
   // Accounts from before v0.4 get a username from their email.
   for (const { email } of q.usersNoUsername.all()) q.setUsername.run(suggestUsername(email, email), email);
@@ -889,7 +889,9 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return m >= 60 && m % 60 === 0 ? `${m / 60} hour${m === 60 ? '' : 's'}` : m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
   };
 
-  const buddyKind = (email) => (BUDDIES[q.userByEmail.get(email)?.avatar]?.name || 'Fox').toLowerCase(); // v1.0: "the little fox"
+  // v1.0: "the little fox": each buddy says its own name (same phrases as the page; a few get a fuller one)
+  const BUDDY_PHRASE = { suitm: 'exec in the suit', suitf: 'boss in the blazer' };
+  const buddyKind = (email) => { const id = q.userByEmail.get(email)?.avatar; return BUDDY_PHRASE[id] || (BUDDIES[id]?.name || 'buddy').toLowerCase(); };
   function shareEmail(share, recipient, isShareBack) {
     const link = shareLink(share, recipient);
     const t = shareTitle(share, isShareBack);
@@ -1369,7 +1371,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     const when = meetupWhen(m);
     const html = emailShell(`
       <p style="font-size:20px;font-weight:600;margin:0 0 8px">${esc(inviter.name)} invited you to ${esc(m.name)} 🧡</p>
-      <p style="color:#6b5a50;margin:0 0 24px">${esc(when)}${m.place_name ? ` · ${esc(m.place_name)}` : ''}. Join to see everyone’s buddy on one map as they head over. Sharing only starts when you tap “I’m on my way”, and it ends on its own.</p>
+      <p style="color:#6b5a50;margin:0 0 24px">${esc(when)}${m.place_name ? ` · ${esc(m.place_name)}` : ''}. On Neerly, everyone picks a buddy: a little character that stands for them on the map. Join to see everyone’s buddy head over to the meetup. Sharing only starts when you tap “I’m on my way”, and it ends on its own.</p>
       ${button(meetupLink(m), 'See the meetup →')}`);
     return sendEmail(to, `${inviter.name} invited you to ${m.name}`, html, meetupLink(m));
   }
