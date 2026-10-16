@@ -1567,6 +1567,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       mq.uninvite.run(m.id, u.email);
       return json(res, 200, { ok: true }), true;
     }
+    // v1.0: take an ended meetup off your list (the host removes it for everyone; it would go a day later anyway).
+    if (action === 'dismiss' && M === 'POST') {
+      const host = m.host_email === u.email;
+      if (meetupLive(m)) throw new HttpError(400, host ? 'End the meetup first' : 'Leave the meetup first');
+      if (host) deleteMeetup(m.id); else { mq.leave.run(m.id, u.email); mq.uninvite.run(m.id, u.email); }
+      return json(res, 200, { ok: true }), true;
+    }
     const me = requireMember(m, u);
 
     if (action === 'go' && M === 'POST') {
