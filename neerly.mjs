@@ -1623,21 +1623,32 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
 
     if (action === 'invite' && M === 'POST') {
       if (!meetupLive(m)) throw new HttpError(410, 'This meetup has ended');
-      const { usernames } = await readBody(req);
+      // By @username, or (v1.0) by saved contact id: the page may not know a contact's username or address.
+      const { usernames, contacts } = await readBody(req);
       const names = [...new Set((Array.isArray(usernames) ? usernames : []).map(normUsername).filter(Boolean))].slice(0, MEETUP_MAX_MEMBERS);
-      if (!names.length) throw new HttpError(400, 'Add someone’s @username');
-      const sent = [], missing = [];
+      const ids = [...new Set((Array.isArray(contacts) ? contacts : []).map(Number).filter(Number.isInteger))].slice(0, MEETUP_MAX_MEMBERS);
+      if (!names.length && !ids.length) throw new HttpError(400, 'Add someone’s @username');
+      const sent = [], missing = [], notOnNeerly = [];
+      const invite = (email, label) => {
+        sent.push(label);
+        if (mq.member.get(m.id, email)) return;
+        if (!mq.invite.run(m.id, email, now()).changes) return;   // already invited: no second buzz
+        pushTo(email, { title: `📍 ${u.name} invited you to ${m.name}`, body: `${meetupWhen(m)}${m.place_name ? ' · ' + m.place_name : ''}. Tap to join.`, url: meetupAppLink(m), tag: `minvite-${m.token}` })
+          .then(nDev => { if (!nDev) inviteEmail(m, u, email); });
+      };
       for (const n of names) {
         const v = q.userByUsername.get(n);
         if (!v || v.email === u.email) { missing.push(n); continue; }
-        if (mq.member.get(m.id, v.email)) { sent.push(n); continue; }
-        sent.push(n);
-        mq.invite.run(m.id, v.email, now());
-        pushTo(v.email, { title: `📍 ${u.name} invited you to ${m.name}`, body: `${meetupWhen(m)}${m.place_name ? ' · ' + m.place_name : ''}. Tap to join.`, url: meetupAppLink(m), tag: `minvite-${m.token}` })
-          .then(nDev => { if (!nDev) inviteEmail(m, u, v.email); });
+        invite(v.email, n);
+      }
+      for (const id of ids) {
+        const c = q.contactById.get(u.email, id);
+        if (!c || c.email === u.email) continue;
+        if (!q.userByEmail.get(c.email)) { notOnNeerly.push(id); continue; }
+        invite(c.email, c.nickname || c.uname || (c.email_known ? c.email : 'them'));
       }
       count('meetup:invite');
-      return json(res, 200, { sent, missing }), true;
+      return json(res, 200, { sent, missing, notOnNeerly }), true;
     }
 
     if (action === 'leave' && M === 'POST') {
