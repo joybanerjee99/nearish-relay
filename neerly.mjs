@@ -372,6 +372,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     );
   `);
   addCol('neerly_shares', 'meetup_id', 'INTEGER');
+  addCol('neerly_users', 'map_consent_at', 'INTEGER');               // v1.0: said yes to being shown on a map (asked once; can be taken back)
   // v1.0: the native apps' notification tokens (APNs on iPhone, FCM on Android)
   db.exec(`CREATE TABLE IF NOT EXISTS neerly_native_push (
       token TEXT PRIMARY KEY,
@@ -382,6 +383,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_native_email ON neerly_native_push(email);`);                   // v0.9: a member's share in a meetup
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_neerly_users_username ON neerly_users(username)');
+  // v1.0: blocks. Either side of a block can't reach the other: no shares, invites, reactions or meetup views.
+  // label is what the blocker saw when they blocked (a name and @username, or an address they already knew).
+  db.exec(`CREATE TABLE IF NOT EXISTS neerly_blocks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      blocker_email TEXT NOT NULL,
+      blocked_email TEXT NOT NULL,
+      label TEXT,
+      created_at INTEGER NOT NULL,
+      UNIQUE (blocker_email, blocked_email)
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_blocks_blocked ON neerly_blocks(blocked_email);`);
   console.log('[neerly] tables ready');
 
   // ── v0.7b Push keys ─────────────────────────────────────────────────────────
@@ -619,6 +631,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     db.prepare('DELETE FROM neerly_stats WHERE email = ?').run(email);
     db.prepare('DELETE FROM neerly_badges WHERE email = ?').run(email);
     deleteMeetupsOf(email);                                              // v0.9
+    db.prepare('DELETE FROM neerly_blocks WHERE blocker_email = ? OR blocked_email = ?').run(email, email); // v1.0
     db.prepare('DELETE FROM neerly_share_backs WHERE from_email = ?').run(email);
     db.prepare('UPDATE neerly_users SET referred_by = NULL WHERE referred_by = ?').run(email);
     db.prepare('DELETE FROM neerly_users WHERE email = ?').run(email);
@@ -839,7 +852,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   function publicUser(u) {
     const look = lookFor(u);
     return { email: u.email, name: u.name, username: u.username, avatar: u.avatar || null, outfit: look.outfit, trailStyle: look.trail, appIcon: u.app_icon === 'night' && unlockedFor(u.email).icon.includes('night') ? 'night' : 'classic',
-      emailVerified: !!u.email_verified_at };
+      emailVerified: !!u.email_verified_at, mapConsent: !!u.map_consent_at };
   }
 
   // Returns the signed-in user or null. Bearer token in Authorization header.
@@ -1115,6 +1128,37 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     return { id: c.id, email: c.email_known ? c.email : null, username: c.email_known ? null : (c.uname || null), nickname: c.nickname || null };
   }
   const contactsFor = (email) => q.contacts.all(email).map(contactOut);
+
+  // ── v1.0 Blocks ─────────────────────────────────────────────────────────────
+  // A block works both ways and is silent: the blocked person isn't told, their shares and invites just don't arrive.
+  const bq = {
+    either:     db.prepare('SELECT 1 FROM neerly_blocks WHERE (blocker_email = ? AND blocked_email = ?) OR (blocker_email = ? AND blocked_email = ?) LIMIT 1'),
+    add:        db.prepare('INSERT OR IGNORE INTO neerly_blocks (blocker_email, blocked_email, label, created_at) VALUES (?, ?, ?, ?)'),
+    list:       db.prepare('SELECT id, label, created_at FROM neerly_blocks WHERE blocker_email = ? ORDER BY created_at DESC, id DESC'),
+    del:        db.prepare('DELETE FROM neerly_blocks WHERE blocker_email = ? AND id = ?'),
+    dropRecips: db.prepare('DELETE FROM neerly_share_recipients WHERE email = ? AND share_id IN (SELECT id FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL)'),
+    delContact: db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ? AND email = ?'),
+  };
+  const blocked = (a, b) => !!a && !!b && a !== b && !!bq.either.get(a, b, b, a);
+  const blocksFor = (email) => bq.list.all(email).map(r => ({ id: r.id, label: r.label || 'Someone', at: r.created_at }));
+  // What the blocker sees in their list: name and @username for people on Neerly (never an address they didn't have).
+  function blockLabel(email, fallback) {
+    const v = q.userByEmail.get(email);
+    return v ? (v.username ? `${v.name} · @${v.username}` : v.name) : fallback;
+  }
+  function removeFromMeetup(mid, email) {
+    const r = mq.member.get(mid, email);
+    if (r) { const s = memberShare(r); if (s && isActive(s)) finalizeShare(s, now()); mq.leave.run(mid, email); }
+    mq.uninvite.run(mid, email);
+  }
+  // Cuts every live link between the two: running shares, the saved contact, and meetups one of them hosts.
+  function applyBlock(blocker, target) {
+    bq.dropRecips.run(target, blocker);
+    bq.dropRecips.run(blocker, target);
+    bq.delContact.run(blocker, target);
+    for (const { id } of mq.hostedBy.all(blocker)) removeFromMeetup(id, target);
+    for (const { id } of mq.hostedBy.all(target)) removeFromMeetup(id, blocker);
+  }
   // The people a share goes to, as the page sends them: { email, nickname } or (v0.7b) { contact: id }, a saved
   // friend added by @username, so the page never had their address. Skips yourself, duplicates and bad entries.
   function collectRecipients(u, list, seen = new Set()) {
@@ -1122,13 +1166,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     for (const r of Array.isArray(list) ? list : []) {
       if (r?.contact != null) {
         const c = q.contactById.get(u.email, Number(r.contact));
-        if (!c || c.email === u.email || seen.has(c.email)) continue;
+        if (!c || c.email === u.email || seen.has(c.email) || blocked(u.email, c.email)) continue;
         seen.add(c.email);
         rs.push({ email: c.email, nickname: c.nickname || null, hidden: 0, handle: c.email_known ? null : (c.uname || null), known: !!c.email_known });
         continue;
       }
       const e = norm(r?.email);
-      if (!isEmail(e) || e === u.email || seen.has(e)) continue;
+      if (!isEmail(e) || e === u.email || seen.has(e) || blocked(u.email, e)) continue;
       seen.add(e);
       rs.push({ email: e, nickname: clean(r?.nickname, 40) || null, hidden: 0, handle: null, known: true });
     }
@@ -1195,6 +1239,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       dest: destOf(share), eta: live ? etaOf(share) : null, arrivedAt: share.arrived_at || null, late: live ? lateOf(share) : null, // v0.8
       location: share.lat != null ? { lat: share.lat, lng: share.lng, accuracy: share.accuracy, at: share.loc_at } : null,
       recipients: q.recipients.all(share.id).map(r => ({
+        id: r.id, // v1.0: lets the sender block this watcher
         // v0.7b: someone picked by @username shows as that; their address stays private.
         email: r.hidden || r.handle ? (r.handle ? '@' + r.handle : maskEmail(r.email)) : r.email,
         nickname: r.nickname || (r.handle ? '@' + r.handle : null), hidden: !!r.hidden || !!r.handle, status: recipientStatus(r), emailed: !!r.emailed,
@@ -1304,7 +1349,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       hostName: host?.name || 'Someone', isHost: !!viewer && viewer.email === m.host_email, isMember,
       maxMembers: MEETUP_MAX_MEMBERS, memberCount: rows.length, quickMessages: MEETUP_MSGS,
     };
-    base.members = rows.map(r => {
+    base.members = rows.filter(r => !viewer || !blocked(viewer.email, r.email)).map(r => {
       const u = q.userByEmail.get(r.email);
       const look = lookFor(u);
       const out = { name: u?.name || 'Someone', username: u?.username || null, avatar: u?.avatar || null, outfit: look.outfit,
@@ -1334,7 +1379,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   }
   // Notify the other members (or everyone) of a meetup.
   function pushMembers(m, exceptEmail, msg) {
-    for (const r of mq.members.all(m.id)) if (r.email !== exceptEmail && r.status !== 'out') pushTo(r.email, { ...msg, url: meetupAppLink(m), tag: msg.tag || `meetup-${m.token}` });
+    for (const r of mq.members.all(m.id)) if (r.email !== exceptEmail && r.status !== 'out' && !blocked(exceptEmail, r.email)) pushTo(r.email, { ...msg, url: meetupAppLink(m), tag: msg.tag || `meetup-${m.token}` });
   }
   // Called when a member's meetup share reaches the place.
   function meetupArrived(share, t) {
@@ -1503,7 +1548,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const t = now();
       const list = mq.mine.all(u.email, t).filter(m => !m.ended_at || t - m.ended_at < MEETUP_KEEP_MS).map(m => meetupListItem(m, u.email));
       // v0.9.1: invitations not yet answered come first
-      const invited = mq.invitedTo.all(u.email, t).filter(m => !mq.member.get(m.id, u.email)).map(m => ({ ...meetupListItem(m, u.email), myState: 'invited', hostName: q.userByEmail.get(m.host_email)?.name || 'Someone' }));
+      const invited = mq.invitedTo.all(u.email, t).filter(m => !mq.member.get(m.id, u.email) && !blocked(u.email, m.host_email)).map(m => ({ ...meetupListItem(m, u.email), myState: 'invited', hostName: q.userByEmail.get(m.host_email)?.name || 'Someone' }));
       list.unshift(...invited);
       return json(res, 200, { meetups: list }), true;
     }
@@ -1540,6 +1585,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (!mm) return false;
     const [, token, action] = mm;
     const m0 = loadMeetup(token);
+    if (blocked(authUser(req)?.email, m0.host_email)) throw new HttpError(404, 'This meetup doesn’t exist anymore'); // v1.0
     // Past its end: mark it ended (the sweep does this too) so every view agrees.
     if (!m0.ended_at && m0.ends_at <= now()) { mq.end.run(m0.ends_at, m0.id); endMeetupShares(m0, m0.ends_at); }
     const m = mq.byId.get(m0.id);
@@ -1638,14 +1684,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const sent = [], missing = [], notOnNeerly = [];
       const invite = (email, label) => {
         sent.push(label);
-        if (mq.member.get(m.id, email)) return;
+        if (mq.member.get(m.id, email) || blocked(u.email, email) || blocked(m.host_email, email)) return; // v1.0: blocks stay silent
         if (!mq.invite.run(m.id, email, now()).changes) return;   // already invited: no second buzz
         pushTo(email, { title: `📍 ${u.name} invited you to ${m.name}`, body: `${meetupWhen(m)}${m.place_name ? ' · ' + m.place_name : ''}. Tap to join.`, url: meetupAppLink(m), tag: `minvite-${m.token}` })
           .then(nDev => { if (!nDev) inviteEmail(m, u, email); });
       };
       for (const n of names) {
         const v = q.userByUsername.get(n);
-        if (!v || v.email === u.email) { missing.push(n); continue; }
+        if (!v || v.email === u.email || blocked(u.email, v.email)) { missing.push(n); continue; }
         invite(v.email, n);
       }
       for (const id of ids) {
@@ -1806,7 +1852,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const look = url.searchParams.get('look') === '1';
       const t = now();
       const bySender = new Map();
-      for (const row of q.watchingFor.all(u.email, t, u.email)) if (!bySender.has(row.sender_email)) bySender.set(row.sender_email, row);
+      for (const row of q.watchingFor.all(u.email, t, u.email)) if (!bySender.has(row.sender_email) && !blocked(u.email, row.sender_email)) bySender.set(row.sender_email, row);
       const friends = [];
       for (const share of bySender.values()) {
         if (look) {
@@ -1899,6 +1945,15 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       }
       if (av !== u.avatar) count('buddy:' + av);
       q.setProfile.run(n, un, av, u.email);
+      return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
+    }
+
+    // v1.0: the one-time "Show your location on a map?" answer. Off again means the page asks before the next share.
+    if (p === '/neerly/me/consent' && M === 'POST') {
+      const u = requireUser(req);
+      const { on } = await readBody(req);
+      db.prepare('UPDATE neerly_users SET map_consent_at = ? WHERE email = ?').run(on ? now() : null, u.email);
+      count(on ? 'consent:yes' : 'consent:off');
       return json(res, 200, { user: publicUser(q.userByEmail.get(u.email)) });
     }
 
@@ -2089,7 +2144,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       if (username != null && String(username).trim() !== '') {
         const un = normUsername(username);
         const friend = un ? q.userByEmail.get(q.userByUsername.get(un)?.email || '') : null;
-        if (!friend) throw new HttpError(404, `No one on Neerly is @${un || '…'}. Check the spelling, or add their email instead.`);
+        if (!friend || blocked(u.email, friend.email)) throw new HttpError(404, `No one on Neerly is @${un || '…'}. Check the spelling, or add their email instead.`);
         if (friend.email === u.email) throw new HttpError(400, 'That’s you');
         q.upsertContact.run(u.email, friend.email, nick, now(), 0);
         return json(res, 200, { contact: contactOut(q.contactByEmail.get(u.email, friend.email)), contacts: contactsFor(u.email) });
@@ -2106,6 +2161,48 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const { id } = await readBody(req);
       q.delContact.run(u.email, Number(id));
       return json(res, 200, { contacts: contactsFor(u.email) });
+    }
+
+    // ---- v1.0: blocking. The page names who to block the way it knows them: a saved contact, an @username,
+    // the sender of a share sent to me, a watcher on my own share, or the host of a meetup. ----
+    if (p === '/neerly/blocks' && M === 'GET') {
+      const u = requireUser(req);
+      return json(res, 200, { blocks: blocksFor(u.email) });
+    }
+    if (p === '/neerly/blocks' && M === 'POST') {
+      const u = requireUser(req);
+      const b = await readBody(req);
+      let email = null, label = null;
+      if (b.contact != null) {
+        const c = q.contactById.get(u.email, Number(b.contact));
+        if (c) { email = c.email; label = c.nickname || blockLabel(c.email, c.email_known ? c.email : '@' + (c.uname || '…')); }
+      } else if (b.username != null) {
+        const v = q.userByUsername.get(normUsername(b.username));
+        if (v) { email = v.email; label = blockLabel(v.email); }
+      } else if (b.share != null && b.recipient != null) {
+        const s = loadOwnedShare(String(b.share), u);
+        const r = q.recipients.all(s.id).find(x => x.id === Number(b.recipient));
+        if (r) { email = r.email; label = blockLabel(r.email, r.handle ? '@' + r.handle : r.hidden ? (r.nickname || 'Someone') : (r.nickname ? `${r.nickname} · ${r.email}` : r.email)); }
+      } else if (b.share != null) {
+        const s = q.shareByToken.get(String(b.share));
+        if (s) { email = s.sender_email; label = blockLabel(s.sender_email, s.sender_name); }
+      } else if (b.meetup != null) {
+        const mt = mq.byToken.get(String(b.meetup));
+        if (mt) { email = mt.host_email; label = blockLabel(mt.host_email); }
+      }
+      if (!email) throw new HttpError(404, 'We couldn’t find that person');
+      if (email === u.email) throw new HttpError(400, 'That’s you');
+      bq.add.run(u.email, email, label || 'Someone', now());
+      applyBlock(u.email, email);
+      count('block');
+      console.log(`[neerly:block] ${u.email} blocked someone`);
+      return json(res, 200, { ok: true, label: label || 'Someone', blocks: blocksFor(u.email), contacts: contactsFor(u.email) });
+    }
+    if (p === '/neerly/blocks/delete' && M === 'POST') {
+      const u = requireUser(req);
+      const { id } = await readBody(req);
+      bq.del.run(u.email, Number(id));
+      return json(res, 200, { blocks: blocksFor(u.email) });
     }
 
     // ---- Create share ----
@@ -2131,7 +2228,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       let original = null, countBack = false;
       if (shareBack) {
         original = q.shareByToken.get(String(shareBack));
-        if (!original) throw new HttpError(404, 'That share link doesn’t exist anymore');
+        if (!original || blocked(u.email, original.sender_email)) throw new HttpError(404, 'That share link doesn’t exist anymore');
         if (original.sender_email === u.email) throw new HttpError(400, 'That’s your own share');
         const refTime = original.ended_at || original.expires_at;
         if (now() - Math.min(refTime, now()) > SHARE_BACK_WINDOW) throw new HttpError(410, 'That share is too old to share back to. Start a new share instead.');
@@ -2193,7 +2290,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       // Public recipient view — also acts as the recipient's "ping".
       if (!action && M === 'GET') {
         let share = q.shareByToken.get(token);
-        if (!share) throw new HttpError(404, 'This link doesn’t match a share');
+        if (!share || blocked(authUser(req)?.email, share.sender_email)) throw new HttpError(404, 'This link doesn’t match a share');
         share = endIfExpired(share);
         const active = isActive(share);
         const r = url.searchParams.get('r');
@@ -2398,6 +2495,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         if (!REACTIONS.includes(emoji)) throw new HttpError(400, 'Pick one of the reactions');
         const me = authUser(req);
         if (me && me.email === share.sender_email) throw new HttpError(400, 'That’s your own share');
+        if (me && blocked(me.email, share.sender_email)) return json(res, 200, { ok: true }); // v1.0: silently dropped
         const recipient = r ? q.recipientByView.get(share.id, String(r)) : null;
         const viewer = !recipient && v && /^[A-Za-z0-9_-]{6,40}$/.test(String(v)) ? String(v) : null;
         if (!recipient && !me && !viewer) throw new HttpError(400, 'Open the share link first');
@@ -2434,6 +2532,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           name = clean(body.name, 40) || known?.nickname || email;
         }
         if (email === share.sender_email) throw new HttpError(400, 'That’s your own share');
+        if (blocked(email, share.sender_email)) return json(res, 200, { ok: true, signedIn: !!signedIn }); // v1.0: silently dropped
         const last = q.lastRequest.get(share.id, email);
         if (last && now() - last.created_at < REQUEST_COOLDOWN) {
           return json(res, 200, { ok: true, alreadyAsked: true, signedIn: !!signedIn });
