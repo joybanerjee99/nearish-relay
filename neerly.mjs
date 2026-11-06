@@ -1433,7 +1433,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     since: db.prepare('SELECT day, key, n FROM neerly_counters WHERE day >= ? ORDER BY day, key'),
     set: db.prepare('INSERT INTO neerly_counters (day, key, n) VALUES (?, ?, ?) ON CONFLICT(day, key) DO UPDATE SET n = excluded.n'),
     activeSince: db.prepare('SELECT COUNT(*) n FROM neerly_users WHERE last_seen >= ?'),
-    users: db.prepare('SELECT COUNT(*) n FROM neerly_users') };
+    users: db.prepare('SELECT COUNT(*) n FROM neerly_users'),
+    accounts: db.prepare('SELECT name, username, email, created_at, last_seen, email_verified_at FROM neerly_users ORDER BY created_at DESC, id DESC') };
   const today = () => new Date(now()).toISOString().slice(0, 10);
   function count(key) { try { cq.inc.run(today(), String(key).slice(0, 60)); } catch {} }
   // v1.0: where a request comes from (the page says): the website, the Home Screen web app, or the iPhone / Android app.
@@ -1530,6 +1531,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
       res.end(DASHBOARD_HTML);
       return true;
+    }
+    // The account list on the dashboard: who has signed up, and nothing about where they've been.
+    if (p === '/neerly/admin/users' && M === 'GET') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      res.setHeader('Cache-Control', 'no-store');
+      const users = cq.accounts.all().map(u => ({ name: u.name, username: u.username, email: u.email, createdAt: u.created_at, lastSeen: u.last_seen, emailConfirmed: !!u.email_verified_at }));
+      return json(res, 200, { users }), true;
     }
     if (p === '/neerly/admin/counts' && M === 'GET') {
       const key = process.env.NEERLY_ADMIN_KEY;

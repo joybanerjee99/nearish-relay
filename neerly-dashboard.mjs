@@ -1,6 +1,7 @@
-// Neerly v1.0: Joy's private usage dashboard (/neerly/admin?key=NEERLY_ADMIN_KEY). Numbers only: the counters
-// never hold who or where. One page, no libraries: stat tiles, single-series line charts with a hover tooltip,
-// bar lists, a table view, and the editor for the server-driven promo line.
+// Neerly v1.0: Joy's private usage dashboard (/neerly/admin?key=NEERLY_ADMIN_KEY). The counters are numbers only:
+// they never hold who or where. The account list comes from the accounts themselves and never includes locations.
+// One page, no libraries: stat tiles, the account list, single-series line charts with a hover tooltip, bar lists,
+// a table view, and the editor for the server-driven promo line.
 export const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>Neerly dashboard</title>
@@ -37,12 +38,17 @@ form.promo input[type=text],form.promo input[type=url],form.promo input[type=dat
 form.promo .row{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--text-secondary)}
 form.promo button{justify-self:start;padding:8px 16px;border-radius:999px;border:0;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
 .empty{color:var(--text-muted);font-size:13px;padding:10px 0}
+.acct-top{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.acct-top input{flex:1;min-width:200px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-0);color:var(--text-primary);font:inherit}
+.acct-scroll{overflow:auto;max-height:440px}.acct-scroll td,.acct-scroll th{white-space:nowrap}
+.acct-scroll th{position:sticky;top:0;background:var(--surface-1)}
 </style></head>
 <body><div class="viz-root"><div class="wrap">
 <div class="top"><div><h1>Neerly dashboard</h1><div class="muted" id="asof">Loading…</div></div>
 <div class="filters" role="group" aria-label="Time range"><button data-d="7">7 days</button><button data-d="30" aria-pressed="true">30 days</button><button data-d="90">90 days</button></div></div>
 
 <h2>People</h2><div class="tiles" id="tiles"></div>
+<h2>Accounts</h2><div class="card"><div class="acct-top"><input type="search" id="acct-q" placeholder="Search name, @username or email" aria-label="Search accounts"><span class="muted" id="acct-n"></span></div><div class="acct-scroll" id="accounts"></div></div>
 <h2>Every day</h2><div class="grid2" id="lines"></div>
 <h2>Where they come from</h2><div class="grid2" id="sources"></div>
 <h2>What they use</h2><div class="grid2" id="features"></div>
@@ -59,7 +65,7 @@ form.promo button{justify-self:start;padding:8px 16px;border-radius:999px;border
 </div></div>
 <script>
 const KEY = new URLSearchParams(location.search).get('key') || '';
-let DAYS = 30, DATA = null;
+let DAYS = 30, DATA = null, ACCOUNTS = null;
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = (n) => Number(n || 0).toLocaleString();
@@ -111,7 +117,7 @@ function barCard(title, sub, obj, label = (k) => k, limit = 10) {
 const strip = (p) => (k) => k.slice(p.length);
 function render() {
   const T = DATA.totals, t = (k) => T[k] || 0;
-  $('#asof').textContent = 'Last ' + DAYS + ' days · numbers only, never who or where · updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  $('#asof').textContent = 'Last ' + DAYS + ' days · charts are numbers only, never who or where · updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const tiles = [['Accounts', latestSnap('snap:users')], ['Active today', latestSnap('snap:active:1d')], ['Active this week', latestSnap('snap:active:7d')], ['Active this month', latestSnap('snap:active:30d')],
     ['Sign-ups', t('signup')], ['Shares', t('share:way') + t('share:now')], ['Meetups', t('meetup:created')], ['Notifications turned on', Object.keys(T).filter(k => k.startsWith('push:on@')).reduce((a, k) => a + T[k], 0)]];
   $('#tiles').innerHTML = tiles.map(([l, v]) => '<div class="tile"><div class="v">' + fmt(v) + '</div><div class="l">' + esc(l) + '</div></div>').join('');
@@ -136,6 +142,20 @@ function render() {
   if (pr && !f.dataset.loaded) { f.text.value = pr.text || ''; f.link.value = pr.link || ''; if (pr.until) f.until.value = new Date(pr.until).toISOString().slice(0, 10); [...f.querySelectorAll('[name=where]')].forEach(c => c.checked = (pr.where || []).includes(c.value)); }
   f.dataset.loaded = 1;
 }
+const dateOf = (t) => t ? new Date(t).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+function renderAccounts() {
+  if (!ACCOUNTS) return;
+  const q = $('#acct-q').value.trim().toLowerCase();
+  const list = ACCOUNTS.filter(u => !q || [u.name, u.username ? '@' + u.username : '', u.email].some(x => String(x).toLowerCase().includes(q)));
+  $('#acct-n').textContent = q ? fmt(list.length) + ' of ' + fmt(ACCOUNTS.length) + ' accounts' : fmt(ACCOUNTS.length) + (ACCOUNTS.length === 1 ? ' account' : ' accounts') + ', newest first';
+  $('#accounts').innerHTML = list.length ? '<table><tr><th>Name</th><th>Username</th><th>Email</th><th>Signed up</th><th>Last active</th><th>Email confirmed</th></tr>' + list.map(u => '<tr><td>' + esc(u.name) + '</td><td>' + (u.username ? '@' + esc(u.username) : '—') + '</td><td>' + esc(u.email) + '</td><td>' + dateOf(u.createdAt) + '</td><td>' + dateOf(u.lastSeen) + '</td><td>' + (u.emailConfirmed ? 'Yes' : 'Not yet') + '</td></tr>').join('') + '</table>' : '<div class="empty">' + (q ? 'No account matches that.' : 'No accounts yet.') + '</div>';
+}
+async function loadAccounts() {
+  const r = await fetch('/neerly/admin/users?key=' + encodeURIComponent(KEY));
+  if (!r.ok) return;
+  ACCOUNTS = (await r.json()).users; renderAccounts();
+}
+$('#acct-q').addEventListener('input', renderAccounts);
 async function load() {
   const r = await fetch('/neerly/admin/counts?key=' + encodeURIComponent(KEY) + '&days=' + DAYS);
   if (!r.ok) { $('#asof').textContent = 'Not allowed: open this page with your admin key (?key=…).'; return; }
@@ -152,4 +172,5 @@ $('#promo').addEventListener('submit', async (e) => {
   $('#promo-msg').textContent = r.ok ? (body.promo.text ? 'Saved. It shows within about 5 minutes.' : 'Removed.') : 'Couldn’t save.';
 });
 load(); setInterval(load, 5 * 60 * 1000);
+loadAccounts(); setInterval(loadAccounts, 5 * 60 * 1000);
 </script></body></html>`;
