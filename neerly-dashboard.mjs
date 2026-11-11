@@ -42,6 +42,7 @@ form.promo button{justify-self:start;padding:8px 16px;border-radius:999px;border
 .acct-top input{flex:1;min-width:200px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-0);color:var(--text-primary);font:inherit}
 .acct-scroll{overflow:auto;max-height:440px}.acct-scroll td,.acct-scroll th{white-space:nowrap}
 .acct-scroll th{position:sticky;top:0;background:var(--surface-1)}
+#retention th:not(:first-child){text-align:right}
 </style></head>
 <body><div class="viz-root"><div class="wrap">
 <div class="top"><div><h1>Neerly dashboard</h1><div class="muted" id="asof">Loading…</div></div>
@@ -49,6 +50,9 @@ form.promo button{justify-self:start;padding:8px 16px;border-radius:999px;border
 
 <h2>People</h2><div class="tiles" id="tiles"></div>
 <h2>Accounts</h2><div class="card"><div class="acct-top"><input type="search" id="acct-q" placeholder="Search name, @username or email" aria-label="Search accounts"><span class="muted" id="acct-n"></span></div><div class="acct-scroll" id="accounts"></div></div>
+<h2>Do people come back?</h2><div class="card"><div class="sub">Still using Neerly at least that many days after signing up. Accounts too new to tell aren’t counted. App Review’s demo accounts are left out; your own test accounts aren’t.</div><div class="acct-scroll" id="retention"></div></div>
+<h2>The share loop</h2><div class="grid2" id="loop"></div>
+<h2>Website</h2><div class="grid2" id="website"></div>
 <h2>Every day</h2><div class="grid2" id="lines"></div>
 <h2>Where they come from</h2><div class="grid2" id="sources"></div>
 <h2>What they use</h2><div class="grid2" id="features"></div>
@@ -115,6 +119,14 @@ function barCard(title, sub, obj, label = (k) => k, limit = 10) {
     rows.map(([k, n]) => '<span>' + esc(label(k)) + '</span><span><span class="bar" style="display:block;width:' + (n ? Math.max(1, n / max * 100) : 0) + '%" title="' + esc(label(k)) + ': ' + fmt(n) + '"></span></span><span class="n">' + fmt(n) + '</span>').join('') + '</div></div>';
 }
 const strip = (p) => (k) => k.slice(p.length);
+// Steps in order, each bar against the first step, with its share of the first step.
+function funnelCard(title, sub, steps) {
+  const first = steps[0][1], max = Math.max(1, ...steps.map(s => s[1]));
+  return '<div class="card"><h3>' + esc(title) + '</h3><div class="sub">' + esc(sub) + '</div><div class="bars">' + steps.map(([l, n], i) => {
+    const pct = i && first && n <= first ? ' · ' + Math.round(n / first * 100) + '%' : '';
+    return '<span>' + esc(l) + '</span><span><span class="bar" style="display:block;width:' + (n ? Math.max(1, n / max * 100) : 0) + '%"></span></span><span class="n">' + fmt(n) + pct + '</span>';
+  }).join('') + '</div></div>';
+}
 function render() {
   const T = DATA.totals, t = (k) => T[k] || 0;
   $('#asof').textContent = 'Last ' + DAYS + ' days · charts are numbers only, never who or where · updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -135,6 +147,9 @@ function render() {
   $('#features').innerHTML = barCard('Features used', 'last ' + DAYS + ' days', feats, (k) => k, 20);
   $('#picks').innerHTML = barCard('Buddies picked', 'at sign-up and when changed', sumKeys(k => k.startsWith('buddy:')), strip('buddy:')) +
     barCard('Outfits put on', '', sumKeys(k => k.startsWith('outfit:')), strip('outfit:')) + barCard('Trail styles picked', '', sumKeys(k => k.startsWith('trail:')), strip('trail:'));
+  $('#website').innerHTML = lineCard('Visits', 'arrived from outside neerly.net, per day', series('visit')) +
+    funnelCard('From visit to sign-up', 'last ' + DAYS + ' days', [['Visits', t('visit')], ['Tapped App Store', t('appstore:tap')], ['Tapped Create account', t('how:getstarted')], ['Signed up on the website', t('signup@web')]]) +
+    barCard('Pages viewed', 'last ' + DAYS + ' days, without reloads', sumKeys(k => k.startsWith('pageview:')), strip('pageview:'));
   const rows = Object.entries(T).filter(([k]) => !k.startsWith('snap:')).sort();
   $('#table').innerHTML = '<table><tr><th>Counter</th><th style="text-align:right">Last ' + DAYS + ' days</th></tr>' + rows.map(([k, n]) => '<tr><td>' + esc(k) + '</td><td class="n">' + fmt(n) + '</td></tr>').join('') + '</table>';
   const pr = DATA.content?.promo;
@@ -156,6 +171,17 @@ async function loadAccounts() {
   ACCOUNTS = (await r.json()).users; renderAccounts();
 }
 $('#acct-q').addEventListener('input', renderAccounts);
+const backCell = (b) => b.of ? fmt(b.n) + ' of ' + fmt(b.of) + ' (' + Math.round(b.n / b.of * 100) + '%)' : '—';
+const weekOf = (w) => new Date(w + 'T12:00:00Z').toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+async function loadGrowth() {
+  const r = await fetch('/neerly/admin/growth?key=' + encodeURIComponent(KEY));
+  if (!r.ok) return;
+  const { retention, loop } = await r.json();
+  const row = (label, c) => '<tr><td>' + esc(label) + '</td><td class="n">' + fmt(c.signups) + '</td><td class="n">' + backCell(c.back[1]) + '</td><td class="n">' + backCell(c.back[7]) + '</td><td class="n">' + backCell(c.back[30]) + '</td></tr>';
+  $('#retention').innerHTML = retention.all.signups ? '<table><tr><th>Signed up</th><th>Accounts</th><th>After 1 day</th><th>After 7 days</th><th>After 30 days</th></tr>' + row('All accounts', retention.all) + retention.weeks.map(c => row('Week of ' + weekOf(c.week), c)).join('') + '</table>' : '<div class="empty">No sign-ups yet.</div>';
+  $('#loop').innerHTML = funnelCard('From account to new account', 'all time, accounts that have done each step', [['Accounts', loop.accounts], ['Started a share', loop.shared], ['Someone watched', loop.watched], ['A watcher signed up', loop.broughtSomeone]]) +
+    '<div class="tile"><div class="v">' + fmt(loop.joinedFromLink) + '</div><div class="l">Accounts that joined from someone’s share link, all time</div></div>';
+}
 async function load() {
   const r = await fetch('/neerly/admin/counts?key=' + encodeURIComponent(KEY) + '&days=' + DAYS);
   if (!r.ok) { $('#asof').textContent = 'Not allowed: open this page with your admin key (?key=…).'; return; }
@@ -173,4 +199,5 @@ $('#promo').addEventListener('submit', async (e) => {
 });
 load(); setInterval(load, 5 * 60 * 1000);
 loadAccounts(); setInterval(loadAccounts, 5 * 60 * 1000);
+loadGrowth(); setInterval(loadGrowth, 5 * 60 * 1000);
 </script></body></html>`;

@@ -1434,7 +1434,8 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     set: db.prepare('INSERT INTO neerly_counters (day, key, n) VALUES (?, ?, ?) ON CONFLICT(day, key) DO UPDATE SET n = excluded.n'),
     activeSince: db.prepare('SELECT COUNT(*) n FROM neerly_users WHERE last_seen >= ?'),
     users: db.prepare('SELECT COUNT(*) n FROM neerly_users'),
-    accounts: db.prepare('SELECT name, username, email, created_at, last_seen, email_verified_at FROM neerly_users ORDER BY created_at DESC, id DESC') };
+    accounts: db.prepare('SELECT name, username, email, created_at, last_seen, email_verified_at FROM neerly_users ORDER BY created_at DESC, id DESC'),
+    growth: db.prepare('SELECT u.email, u.created_at, u.last_seen, u.referred_by, COALESCE(s.shares_sent, 0) shares, COALESCE(s.times_watched, 0) watched FROM neerly_users u LEFT JOIN neerly_stats s ON s.email = u.email') };
   const today = () => new Date(now()).toISOString().slice(0, 10);
   function count(key) { try { cq.inc.run(today(), String(key).slice(0, 60)); } catch {} }
   // v1.0: where a request comes from (the page says): the website, the Home Screen web app, or the iPhone / Android app.
@@ -1453,8 +1454,36 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       cq.set.run(d, 'snap:users', cq.users.get().n);
     } catch {}
   }
+  // Retention and the share loop, worked out from each account's dates and lifetime totals (numbers only; App Review's demo accounts left out).
+  // "Came back" means still using Neerly at least that many days after signing up. An account counts only once it's old enough to have done so.
+  const REVIEW_ACCOUNTS = new Set(['review.a@neerly.net', 'review.b@neerly.net']);
+  const RETENTION_DAYS = [1, 7, 30];
+  function growthReport(t) {
+    const rows = cq.growth.all().filter(u => !REVIEW_ACCOUNTS.has(u.email));
+    const blank = (week) => ({ week, signups: 0, back: Object.fromEntries(RETENTION_DAYS.map(d => [d, { n: 0, of: 0 }])) });
+    const all = blank(null), weeks = new Map();
+    for (const u of rows) {
+      const d = new Date(u.created_at); d.setUTCHours(0, 0, 0, 0); d.setUTCDate(d.getUTCDate() - (d.getUTCDay() + 6) % 7); // the Monday of that week
+      const week = d.toISOString().slice(0, 10);
+      if (!weeks.has(week)) weeks.set(week, blank(week));
+      for (const c of [all, weeks.get(week)]) {
+        c.signups++;
+        for (const days of RETENTION_DAYS) {
+          if (t - u.created_at < days * 86400000) continue;
+          c.back[days].of++;
+          if ((u.last_seen || 0) - u.created_at >= days * 86400000) c.back[days].n++;
+        }
+      }
+    }
+    return {
+      retention: { all, weeks: [...weeks.values()].sort((a, b) => b.week.localeCompare(a.week)).slice(0, 12) },
+      loop: { accounts: rows.length, shared: rows.filter(u => u.shares > 0).length, watched: rows.filter(u => u.watched > 0).length,
+        broughtSomeone: new Set(rows.map(u => u.referred_by).filter(Boolean)).size, joinedFromLink: rows.filter(u => u.referred_by).length },
+    };
+  }
   // Events the page reports itself (only these names; numbers only).
-  const PAGE_EVENTS = new Set(['postcard:made', 'postcard:shared', 'quickstart:used', 'repeat:used', 'share:sheet', 'share:copy', 'invite:sheet', 'invite:copy', 'how:view', 'how:getstarted', 'promo:tap']);
+  const PAGE_EVENTS = new Set(['postcard:made', 'postcard:shared', 'quickstart:used', 'repeat:used', 'share:sheet', 'share:copy', 'invite:sheet', 'invite:copy', 'how:view', 'how:getstarted', 'promo:tap', 'appstore:tap']);
+  const VISIT_PAGES = new Set(['how', 'privacy', 'terms', 'support', 'delete-account', 'press']); // the info pages on neerly.net (neerly-assets/visit.js)
   const eventLimits = new Map(); // ip -> { n, at }
   // v1.0: marketing content that can change without an app update (a promo line on the share screen, etc.).
   const contentGet = () => { try { return JSON.parse(metaGet('content') || '{}'); } catch { return {}; } };
@@ -1499,9 +1528,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       lim.n++; eventLimits.set(ip, lim);
       if (eventLimits.size > 5000) eventLimits.clear();
       if (lim.n > 60) return json(res, 429, { error: 'Slow down' }), true;
-      const { k, c, client } = await readBody(req);
+      const { k, c, client, page, entry } = await readBody(req);
       const cl = clientOf(client);
       if (PAGE_EVENTS.has(k)) count(k), count(`${k}@${cl}`);
+      if (k === 'visit' && VISIT_PAGES.has(page)) { count('pageview:' + page); if (entry === true) count('visit'); }
       if (typeof c === 'string' && /^[a-z0-9_-]{1,32}$/i.test(c)) count('landing:' + c.toLowerCase()); // a campaign link (?c=…)
       return json(res, 200, { ok: true }), true;
     }
@@ -1539,6 +1569,11 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       res.setHeader('Cache-Control', 'no-store');
       const users = cq.accounts.all().map(u => ({ name: u.name, username: u.username, email: u.email, createdAt: u.created_at, lastSeen: u.last_seen, emailConfirmed: !!u.email_verified_at }));
       return json(res, 200, { users }), true;
+    }
+    if (p === '/neerly/admin/growth' && M === 'GET') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      return json(res, 200, growthReport(now())), true;
     }
     if (p === '/neerly/admin/counts' && M === 'GET') {
       const key = process.env.NEERLY_ADMIN_KEY;
