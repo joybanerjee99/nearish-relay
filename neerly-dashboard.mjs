@@ -50,6 +50,7 @@ form.promo button{justify-self:start;padding:8px 16px;border-radius:999px;border
 
 <h2>People</h2><div class="tiles" id="tiles"></div>
 <h2>Accounts</h2><div class="card"><div class="acct-top"><input type="search" id="acct-q" placeholder="Search name, @username or email" aria-label="Search accounts"><span class="muted" id="acct-n"></span></div><div class="acct-scroll" id="accounts"></div></div>
+<h2>Reports</h2><div class="card"><div class="sub">Sent from Profile → Privacy &amp; safety, or from “Block and report”. Each one is emailed as it arrives; this is the copy that can’t get lost. Newest first, last 200.</div><div class="acct-scroll" id="reports"></div></div>
 <h2>Do people come back?</h2><div class="card"><div class="sub">Still using Neerly at least that many days after signing up. Accounts too new to tell aren’t counted. App Review’s demo accounts are left out; your own test accounts aren’t.</div><div class="acct-scroll" id="retention"></div></div>
 <h2>The share loop</h2><div class="grid2" id="loop"></div>
 <h2>Website</h2><div class="grid2" id="website"></div>
@@ -171,6 +172,19 @@ async function loadAccounts() {
   ACCOUNTS = (await r.json()).users; renderAccounts();
 }
 $('#acct-q').addEventListener('input', renderAccounts);
+// v1.0.2: what people reported, including "something isn't working in the app".
+const whenOf = (t) => t ? new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+async function loadReports() {
+  const r = await fetch('/neerly/admin/reports?key=' + encodeURIComponent(KEY));
+  if (!r.ok) return;
+  const { reports } = await r.json();
+  $('#reports').innerHTML = reports.length
+    ? '<table><tr><th>When</th><th>What</th><th>From</th><th>About</th><th>What they said</th></tr>'
+      + reports.map(x => '<tr><td>' + whenOf(x.at) + '</td><td>' + esc(x.reasonText) + '</td><td>' + esc(x.from) + '</td><td>'
+        + (x.about ? esc(x.aboutLabel || x.about) : '—') + '</td><td>' + (x.note ? esc(x.note) : '—') + '</td></tr>').join('')
+      + '</table>'
+    : '<div class="empty">Nothing reported. Good sign.</div>';
+}
 const backCell = (b) => b.of ? fmt(b.n) + ' of ' + fmt(b.of) + ' (' + Math.round(b.n / b.of * 100) + '%)' : '—';
 const weekOf = (w) => new Date(w + 'T12:00:00Z').toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 async function loadGrowth() {
@@ -199,5 +213,6 @@ $('#promo').addEventListener('submit', async (e) => {
 });
 load(); setInterval(load, 5 * 60 * 1000);
 loadAccounts(); setInterval(loadAccounts, 5 * 60 * 1000);
+loadReports(); setInterval(loadReports, 5 * 60 * 1000);
 loadGrowth(); setInterval(loadGrowth, 5 * 60 * 1000);
 </script></body></html>`;

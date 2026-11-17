@@ -1156,6 +1156,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // v1.0.2 Reports
   const REPORT_EMAIL = process.env.NEERLY_REPORT_EMAIL || 'hello@neerly.net';
   const REPORT_REASONS = {
+    bug: 'Something isn’t working in the app',
     harassment: 'Harassment or bullying',
     stalking: 'Someone is tracking or following me',
     impersonation: 'Pretending to be someone else',
@@ -2319,12 +2320,13 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       count('report');
       console.log(`[neerly:report] ${reason}${target ? ' about someone' : ''}`);
       const esc = (s) => String(s == null ? '' : s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
-      sendEmail(REPORT_EMAIL, `Neerly report: ${REPORT_REASONS[reason]}`,
+      const isBug = reason === 'bug';
+      sendEmail(REPORT_EMAIL, `${isBug ? 'Neerly feedback' : 'Neerly report'}: ${REPORT_REASONS[reason]}`,
         `<p><b>${esc(REPORT_REASONS[reason])}</b></p>
-         <p>From: ${esc(u.email)}${u.username ? ' (@' + esc(u.username) + ')' : ''}<br>
-         About: ${target ? esc(label || target) + ' &lt;' + esc(target) + '&gt;' : 'nobody in particular'}</p>
+         <p>From: ${esc(u.email)}${u.username ? ' (@' + esc(u.username) + ')' : ''}${isBug ? '' : `<br>
+         About: ${target ? esc(label || target) + ' &lt;' + esc(target) + '&gt;' : 'nobody in particular'}`}</p>
          ${note ? `<p>What they said:<br>${esc(note).replace(/\n/g, '<br>')}</p>` : ''}
-         <p style="color:#888;font-size:13px">Dashboard → Reports. Blocking is separate: this report alone changes nothing for either person.</p>`,
+         <p style="color:#888;font-size:13px">${isBug ? 'Dashboard → Reports keeps a copy.' : 'Dashboard → Reports. Blocking is separate: this report alone changes nothing for either person.'}</p>`,
         'report').catch(() => {});
       return json(res, 200, { ok: true });
     }
