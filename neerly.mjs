@@ -394,6 +394,19 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       UNIQUE (blocker_email, blocked_email)
     );
     CREATE INDEX IF NOT EXISTS idx_neerly_blocks_blocked ON neerly_blocks(blocked_email);`);
+  // v1.0.2: reports. Google Play expects a way to report people or what they write (statuses,
+  // place and meetup names, quick messages). Kept quiet in Profile → Privacy & safety, and offered
+  // when someone blocks. A report is a message to us; the person reported is never told.
+  db.exec(`CREATE TABLE IF NOT EXISTS neerly_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reporter_email TEXT NOT NULL,
+      target_email TEXT,
+      target_label TEXT,
+      reason TEXT NOT NULL,
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neerly_reports_at ON neerly_reports(created_at);`);
   console.log('[neerly] tables ready');
 
   // ── v0.7b Push keys ─────────────────────────────────────────────────────────
@@ -1140,6 +1153,22 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     delContact: db.prepare('DELETE FROM neerly_contacts WHERE owner_email = ? AND email = ?'),
   };
   const blocked = (a, b) => !!a && !!b && a !== b && !!bq.either.get(a, b, b, a);
+  // v1.0.2 Reports
+  const REPORT_EMAIL = process.env.NEERLY_REPORT_EMAIL || 'hello@neerly.net';
+  const REPORT_REASONS = {
+    harassment: 'Harassment or bullying',
+    stalking: 'Someone is tracking or following me',
+    impersonation: 'Pretending to be someone else',
+    content: 'Offensive name or message',
+    spam: 'Spam or scam',
+    child: 'Concern about a child’s safety',
+    other: 'Something else',
+  };
+  const rq = {
+    add:    db.prepare('INSERT INTO neerly_reports (reporter_email, target_email, target_label, reason, note, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    recent: db.prepare('SELECT id, reporter_email, target_email, target_label, reason, note, created_at FROM neerly_reports ORDER BY created_at DESC, id DESC LIMIT 200'),
+    sinceBy: db.prepare('SELECT COUNT(*) n FROM neerly_reports WHERE reporter_email = ? AND created_at > ?'),
+  };
   const blocksFor = (email) => bq.list.all(email).map(r => ({ id: r.id, label: r.label || 'Someone', at: r.created_at }));
   // What the blocker sees in their list: name and @username for people on Neerly (never an address they didn't have).
   function blockLabel(email, fallback) {
@@ -1574,6 +1603,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const key = process.env.NEERLY_ADMIN_KEY;
       if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
       return json(res, 200, growthReport(now())), true;
+    }
+    // v1.0.2: what people have reported. Emailed when it arrives; listed here so nothing is lost.
+    if (p === '/neerly/admin/reports' && M === 'GET') {
+      const key = process.env.NEERLY_ADMIN_KEY;
+      if (!key || url.searchParams.get('key') !== key) throw new HttpError(404, 'Not found');
+      res.setHeader('Cache-Control', 'no-store');
+      const reports = rq.recent.all().map(r => ({
+        id: r.id, at: r.created_at, reason: r.reason, reasonText: REPORT_REASONS[r.reason] || r.reason,
+        from: r.reporter_email, about: r.target_email, aboutLabel: r.target_label, note: r.note,
+      }));
+      return json(res, 200, { reports }), true;
     }
     if (p === '/neerly/admin/counts' && M === 'GET') {
       const key = process.env.NEERLY_ADMIN_KEY;
@@ -2247,6 +2287,46 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const { id } = await readBody(req);
       bq.del.run(u.email, Number(id));
       return json(res, 200, { blocks: blocksFor(u.email) });
+    }
+    // v1.0.2: report a person or something they wrote. Goes to us by email and sits in the
+    // dashboard; the person reported is never told. Optionally about nobody in particular.
+    if (p === '/neerly/reports' && M === 'POST') {
+      const u = requireUser(req);
+      const b = await readBody(req);
+      const reason = REPORT_REASONS[String(b.reason || '')] ? String(b.reason) : 'other';
+      const note = String(b.note || '').trim().slice(0, 2000);
+      // A quiet limit so a stuck tap can't flood the inbox.
+      if ((rq.sinceBy.get(u.email, now() - 3600e3) || {}).n >= 10) throw new HttpError(429, 'Thanks, we’ve got your reports. Please give us a little time.');
+      let target = null, label = null;
+      if (b.contact != null) {
+        const c = q.contactById.get(u.email, Number(b.contact));
+        if (c) { target = c.email; label = c.nickname || blockLabel(c.email, c.email_known ? c.email : '@' + (c.uname || '…')); }
+      } else if (b.username != null) {
+        const v = q.userByUsername.get(normUsername(String(b.username)));
+        if (v) { target = v.email; label = blockLabel(v.email); }
+      } else if (b.share != null && b.recipient != null) {
+        const s = loadOwnedShare(String(b.share), u);
+        const r = q.recipients.all(s.id).find(x => x.id === Number(b.recipient));
+        if (r) { target = r.email; label = blockLabel(r.email, r.handle ? '@' + r.handle : (r.nickname || 'Someone')); }
+      } else if (b.share != null) {
+        const s = q.shareByToken.get(String(b.share));
+        if (s) { target = s.sender_email; label = blockLabel(s.sender_email, s.sender_name); }
+      } else if (b.meetup != null) {
+        const mt = mq.byToken.get(String(b.meetup));
+        if (mt) { target = mt.host_email; label = blockLabel(mt.host_email); }
+      }
+      rq.add.run(u.email, target, label, reason, note || null, now());
+      count('report');
+      console.log(`[neerly:report] ${reason}${target ? ' about someone' : ''}`);
+      const esc = (s) => String(s == null ? '' : s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+      sendEmail(REPORT_EMAIL, `Neerly report: ${REPORT_REASONS[reason]}`,
+        `<p><b>${esc(REPORT_REASONS[reason])}</b></p>
+         <p>From: ${esc(u.email)}${u.username ? ' (@' + esc(u.username) + ')' : ''}<br>
+         About: ${target ? esc(label || target) + ' &lt;' + esc(target) + '&gt;' : 'nobody in particular'}</p>
+         ${note ? `<p>What they said:<br>${esc(note).replace(/\n/g, '<br>')}</p>` : ''}
+         <p style="color:#888;font-size:13px">Dashboard → Reports. Blocking is separate: this report alone changes nothing for either person.</p>`,
+        'report').catch(() => {});
+      return json(res, 200, { ok: true });
     }
 
     // ---- Create share ----
