@@ -99,6 +99,15 @@ const BUDDIES = {
      <circle cx="20" cy="22" r="5" fill="#f2bd62"/><circle cx="44" cy="22" r="5" fill="#f2bd62"/><circle cx="20" cy="22" r="2.4" fill="#d9944a"/><circle cx="44" cy="22" r="2.4" fill="#d9944a"/>
      <circle cx="32" cy="37" r="15.5" fill="#f2bd62"/><ellipse cx="32" cy="44" rx="8.5" ry="6" fill="#fbe2b3"/>
      ${eyes(34)}<path d="M29.2 40 h5.6 l-2.8 3 Z" fill="#6e3f22"/><path d="M32 43 v1.5" stroke="${INK}" stroke-width="1.4"/>${catMouth(44.2)}` },
+  tiger: { name: 'Tiger', svg:
+    `<circle cx="19.5" cy="21.5" r="6" fill="#d97c28"/><circle cx="44.5" cy="21.5" r="6" fill="#d97c28"/>
+     <circle cx="19.5" cy="21.5" r="2.9" fill="#f6b99a"/><circle cx="44.5" cy="21.5" r="2.9" fill="#f6b99a"/>
+     <circle cx="32" cy="36" r="20" fill="#ef9b3f"/>
+     <path d="M26.5 19.5 v6 M32 18 v6.8 M37.5 19.5 v6" stroke="#3a2318" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+     <path d="M15 32.5 q4 1.6 7.4 1 M15.4 39 q4 1.6 7.2 .7" stroke="#3a2318" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+     <path d="M49 32.5 q-4 1.6 -7.4 1 M48.6 39 q-4 1.6 -7.2 .7" stroke="#3a2318" stroke-width="2.2" stroke-linecap="round" fill="none"/>
+     <ellipse cx="32" cy="44" rx="9" ry="6.4" fill="#fdf3e6"/>
+     ${eyes(34)}<path d="M29.2 40.5 h5.6 l-2.8 3 Z" fill="#6e3f22"/><path d="M32 43.5 v1.4" stroke="${INK}" stroke-width="1.4"/>${catMouth(44.8)}` },
 };
 const DEFAULT_BUDDY = 'fox';
 // v0.5 — outfits. Each buddy has anchor points so items sit on the head, eyes and neck.
@@ -112,6 +121,7 @@ const ANCHOR = {
   ghost: { top: 15, eye: 32, dx: 7, neck: 47 }, robot: { top: 17, eye: 33, dx: 7, neck: 53 },
   suitm: { top: 14, eye: 32, dx: 6.5, neck: 49 }, suitf: { top: 14, eye: 32, dx: 6.5, neck: 49 },
   wolf: { top: 17, eye: 34, dx: 7, neck: 55 },  lion: { top: 17, eye: 34, dx: 7, neck: 55 },
+  tiger: { top: 17, eye: 34, dx: 7, neck: 54 },
 };
 const ACCESSORIES = {
   beanie:   { slot: 'head', name: 'Beanie',  draw: (a) => { const t = a.top; return `<path d="M19 ${t + 3} a13 11.5 0 0 1 26 0 z" fill="#3d8bd3"/><path d="M24 ${t - 5} v7 M29 ${t - 7.5} v9 M35 ${t - 7.5} v9 M40 ${t - 5} v7" stroke="#2f73b3" stroke-width="1.4"/><rect x="17.5" y="${t + 0.5}" width="29" height="5.5" rx="2.7" fill="#2a66a3"/><circle cx="32" cy="${t - 9.5}" r="3.4" fill="#f4f1ee"/>`; } },
