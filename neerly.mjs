@@ -86,6 +86,7 @@ const PRESET_NAME_MAX    = 30;
 // v0.8 — arrival and ETA
 const ARRIVE_M           = 60;                   // within 60 m of the pin counts as arrived…
 const ARRIVE_MAX_M       = 150;                  // …or within the fix's accuracy, up to 150 m
+const ARRIVE_ARM_M       = 50;                   // v1.0.2: …but only once you've been this far past that radius
 const MOVING_MPS         = 0.4;                  // slower than this, the ETA isn't shown (standing still)
 const SPEED_STALE_MS     = 3 * 60 * 1000;        // a speed older than this isn't used
 const NEAR_S             = 5 * 60;               // "Ana is about 5 min away"
@@ -334,6 +335,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   addCol('neerly_shares', 'battery', 'REAL');
   addCol('neerly_shares', 'near_pushed', 'INTEGER NOT NULL DEFAULT 0');
   addCol('neerly_shares', 'arrived_at', 'INTEGER');
+  // v1.0.2: when the sender was first seen clearly away from their destination. Arrival only counts
+  // once this is set, so a share that starts at its own destination ("I'm at home", with home as the
+  // pin) runs the time the sender picked instead of ending on its very first location fix.
+  addCol('neerly_shares', 'away_at', 'INTEGER');
   addCol('neerly_shares', 'late_on', 'INTEGER NOT NULL DEFAULT 0');
   addCol('neerly_shares', 'late_due', 'INTEGER');
   addCol('neerly_shares', 'late_grace', 'INTEGER');
@@ -538,7 +543,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     activeShareFor:db.prepare('SELECT * FROM neerly_shares WHERE sender_email = ? AND ended_at IS NULL AND expires_at > ? ORDER BY started_at DESC LIMIT 1'),
     endShare:      db.prepare('UPDATE neerly_shares SET ended_at = ?, lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL WHERE id = ? AND ended_at IS NULL'),
     // v0.8: the destination pin, speed and battery go with the location; the place's name (the note) stays for the summary
-    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL, dest_lat = NULL, dest_lng = NULL, speed_mps = NULL, speed_at = NULL, battery = NULL WHERE id = ?'),
+    wipeShareLoc:  db.prepare('UPDATE neerly_shares SET lat = NULL, lng = NULL, accuracy = NULL, weather = NULL, weather_at = NULL, dest_lat = NULL, dest_lng = NULL, speed_mps = NULL, speed_at = NULL, battery = NULL, away_at = NULL WHERE id = ?'),
     setDest:       db.prepare('UPDATE neerly_shares SET dest_lat = ?, dest_lng = ?, note = ?, near_pushed = 0 WHERE id = ?'),
     setEtaAt:      db.prepare('UPDATE neerly_shares SET eta_at = ?, near_pushed = 0 WHERE id = ?'),
     lateDueToEta:  db.prepare('UPDATE neerly_shares SET late_due = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ? AND late_on = 1'),
@@ -547,6 +552,7 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     setBattery:    db.prepare('UPDATE neerly_shares SET battery = ? WHERE id = ?'),
     setNearPushed: db.prepare('UPDATE neerly_shares SET near_pushed = 1 WHERE id = ?'),
     setArrived:    db.prepare('UPDATE neerly_shares SET arrived_at = ? WHERE id = ?'),
+    setAway:       db.prepare('UPDATE neerly_shares SET away_at = ? WHERE id = ?'),  // v1.0.2: arms arrival
     setLate:       db.prepare('UPDATE neerly_shares SET late_on = ?, late_due = ?, late_grace = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ?'),
     extendLate:    db.prepare('UPDATE neerly_shares SET late_due = ?, late_warned_at = NULL, late_nudged_at = NULL WHERE id = ?'),
     lateOpen:      db.prepare('SELECT * FROM neerly_shares WHERE late_on = 1 AND ended_at IS NULL AND late_nudged_at IS NULL AND late_due <= ?'),
@@ -1042,6 +1048,17 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
   // The destination is a pin the sender dropped (or a saved place on their phone) plus the name they typed.
   // It lives on the share only while it runs, like the location. ETA = straight-line distance ÷ recent speed.
   function arriveRadius(accuracy) { return Math.max(ARRIVE_M, Math.min(Number(accuracy) || 0, ARRIVE_MAX_M)); }
+
+  // v1.0.2 — arming arrival. You can only arrive somewhere you have first been away from.
+  // Called wherever a destination is set, with the position the sender was at in that moment: if that
+  // is already well outside the pin, the share is armed straight away (the ordinary case, someone
+  // setting off), and if it is inside, away_at stays null and nothing can end the share early.
+  // The extra ARRIVE_ARM_M beyond the radius is so one jittery fix can't arm and arrive at once.
+  function armArrival(shareId, here, dest, t, accuracy) {
+    if (!dest || !validCoord(here && here.lat, here && here.lng)) return;
+    const away = meters(here, dest) > arriveRadius(accuracy) + ARRIVE_ARM_M;
+    q.setAway.run(away ? t : null, shareId);
+  }
   function destOf(share) {
     return share.dest_lat != null ? { lat: share.dest_lat, lng: share.dest_lng, name: share.note || '' } : null;
   }
@@ -1078,7 +1095,14 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
     if (share.dest_lat == null) return share;
     const here = { lat: share.lat, lng: share.lng };
     const d = meters(here, { lat: share.dest_lat, lng: share.dest_lng });
-    if (d <= arriveRadius(share.accuracy)) {
+    // v1.0.2: arm on the way out, arrive on the way back in. Until away_at is set there is nothing to
+    // arrive at, which is what keeps "I'm at Grandma's" from ending the moment it starts.
+    if (share.away_at == null) {
+      if (d > arriveRadius(share.accuracy) + ARRIVE_ARM_M) {
+        q.setAway.run(t, share.id);
+        share = q.shareByToken.get(share.token);
+      }
+    } else if (d <= arriveRadius(share.accuracy)) {
       q.setArrived.run(t, share.id);
       finalizeShare(share, t);
       if (share.meetup_id) meetupArrived(share, t); // v0.9
@@ -1733,7 +1757,15 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
       const created = db.transaction(() => {
         const info = q.insertShare.run(stoken, u.email, u.name, t, m.ends_at, Number(lat), Number(lng), numOrNull(accuracy), t, 'way', note, 1);
         addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
-        if (m.place_lat != null) q.setDest.run(m.place_lat, m.place_lng, note, info.lastInsertRowid);
+        if (m.place_lat != null) {
+          q.setDest.run(m.place_lat, m.place_lng, note, info.lastInsertRowid);
+          // v1.0.2: a meetup is armed from the start, unlike a share you set up yourself. The pin is a
+          // rendezvous everyone is converging on, so getting there is the whole point and tapping
+          // "I'm on my way" while already at the restaurant should read as arrived — see the afterMove
+          // call below. A solo share's pin is your own destination, where "I'm already there" is a
+          // state worth broadcasting for an hour, which is why that path arms on the way out instead.
+          q.setAway.run(t, info.lastInsertRowid);
+        }
         mq.setMeetup.run(m.id, info.lastInsertRowid);
         mq.setShare.run(info.lastInsertRowid, me.id);
         countShareStart(u.email, t, Number(tzOffset));
@@ -2409,7 +2441,10 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
           showLoc ? Number(lat) : null, showLoc ? Number(lng) : null, showLoc ? numOrNull(accuracy) : null, showLoc ? t : null,
           mode, note, showLoc ? 1 : 0);
         if (mode === 'way') addTrailPoint(info.lastInsertRowid, Number(lat), Number(lng), numOrNull(accuracy), t);
-        if (dest) q.setDest.run(dest.lat, dest.lng, note, info.lastInsertRowid);
+        if (dest) {
+          q.setDest.run(dest.lat, dest.lng, note, info.lastInsertRowid);
+          armArrival(info.lastInsertRowid, { lat: Number(lat), lng: Number(lng) }, dest, t, accuracy); // v1.0.2
+        }
         if (late) q.setLate.run(1, t + late.byMin * 60000, late.graceMin, info.lastInsertRowid);
         countShareStart(u.email, t, Number(tzOffset));
         for (const r of rs) {
@@ -2549,11 +2584,15 @@ export function createNeerly({ db, resend, appUrl, fromEmail }) {
         const body = await readBody(req);
         if (body.clear) {
           q.setDest.run(null, null, share.note, share.id);
+          q.setAway.run(null, share.id); // v1.0.2: no destination, nothing armed
           q.setLate.run(0, null, null, share.id);
         } else {
           const dest = parseDest(body);
           if (!dest) throw new HttpError(400, 'Drop a pin for where you’re going');
           q.setDest.run(dest.lat, dest.lng, dest.name || share.note, share.id);
+          // v1.0.2: re-arm against where the sender is now. Adding a pin for the place you are already
+          // standing in used to end the share on the next fix.
+          armArrival(share.id, { lat: share.lat, lng: share.lng }, dest, now(), share.accuracy);
         }
         return json(res, 200, { share: senderView(q.shareByToken.get(token), 0) });
       }
